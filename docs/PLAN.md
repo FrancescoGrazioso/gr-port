@@ -322,7 +322,19 @@ unsupported types, thunk self-test passed, Vulkan window at 60 Hz.
    diffuse 256x256 BC3 (alpha-masked, grey-blue clouds in RGB) and a 256x256 BC1 starfield sampled
    at param4 = a 2x2 UV transform of the mesh UV (ES, cbuffer dwords 0x1c-0x2d). The PS adds
    star * diffuse.a * constant to diffuse * lighting; the body colour must come from the material
-   constants or a later pass. Compare with a real frame before changing anything.
+   constants or a later pass.
+   **Root cause found (RenderDoc, same day):** the cat's UVs are correct (param0 = diffuse UV,
+   param4 = star UV at 2x its frequency), but guest textures are uploaded with **mip 0 only**
+   (the Vulkan image has 1 level even when the T# says levels 0-8). The cat covers ~100 px, so the
+   256x256 starfield is minified without mips and aliases into large black/white blotches. Every
+   distant textured surface has the same problem. Next step: upload all levels. Layout (shadPS4
+   `ComputeImageSize`, texture_cache/tile.h): level i uses `pitch >> i` (rounded up to a power of
+   two when T# `pow2pad` is set; BC sizes in blocks), 1D-thin levels are padded to 8x8 elements and
+   grown in pitch until the size is a multiple of 256 bytes, levels are stored one after another
+   (each level holding all array layers), and Pow2Bcn64/128ImageTable covers square pow2 BC
+   textures. Last level = T# dword 3 bits 16-19 (`last_level`); macro-tiled mips fall back to
+   micro tiling below the macro-tile extents. Detile each level with Detile1D and copy it into
+   mip i of a multi-level image (image view and sampler maxLod already allow it).
    The missing movie between the apple and gameplay is `mp4/ep00-01c.mp4` (AvPlayer is a stub).
    **Kat investigation, 2026-10-17 (afternoon), state when stopped:**
    - Auto-exposure fixed: the game reads the 1x1 average-luminance render target on the CPU
