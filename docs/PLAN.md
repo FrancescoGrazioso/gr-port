@@ -304,7 +304,11 @@ unsupported types, thunk self-test passed, Vulkan window at 60 Hz.
      emit / cut are counted per invocation and stored (count | cut mask << 8) in an aux buffer;
    - buffer accesses now implement GCN swizzled addressing (V# swizzle_enable, element size, index
      stride, ADD_TID) in `buf_addr`, so the ring layouts are exactly the hardware ones;
-   - the rings are GPU buffers keyed by their V# base (only shaders touch them);
+   - the rings are two dedicated GPU buffers (ESGS, GSVS, 64 MB each), bound by exact V# base match
+     for the current draw (only shaders touch them). The game's GSVS ring sits 4 MB after the ESGS
+     ring; an earlier version bound rings by address range, so the GSVS landed inside the ESGS
+     buffer and large draws were clipped. Fixing it brought back the texture coordinates of the
+     characters: Kat's dress patterns and forearm ornaments now render (2026-10-18);
    - the draw becomes the copy VS over a triangle list: instance = GS invocation, vertex = corner
      of triangle j of its strip; v0 = the GSVS offset of strip vertex e; triangles past the emitted
      count or across a cut get a zero position.
@@ -313,6 +317,13 @@ unsupported types, thunk self-test passed, Vulkan window at 60 Hz.
    Remaining for the geometry pipeline: only triangle-list input is handled; GS instancing, streams
    other than 0 and output primitive types other than strips are not; tessellation (LS/HS) is not
    emulated.
+   Open: Dusty (the cat) still looks wrong (grey-blue blotches instead of a black body with stars
+   and a light outline). Draw: VS 0x24e617d00 / PS 0x24e622a00, ES 0x24e612d00, GS 0x24e617f00;
+   diffuse 256x256 BC3 (alpha-masked, grey-blue clouds in RGB) and a 256x256 BC1 starfield sampled
+   at param4 = a 2x2 UV transform of the mesh UV (ES, cbuffer dwords 0x1c-0x2d). The PS adds
+   star * diffuse.a * constant to diffuse * lighting; the body colour must come from the material
+   constants or a later pass. Compare with a real frame before changing anything.
+   The missing movie between the apple and gameplay is `mp4/ep00-01c.mp4` (AvPlayer is a stub).
    **Kat investigation, 2026-10-17 (afternoon), state when stopped:**
    - Auto-exposure fixed: the game reads the 1x1 average-luminance render target on the CPU
      (eboot+0x27358f). Tiny colour targets (<= 64 px) are now copied back to guest memory after

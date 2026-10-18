@@ -250,6 +250,49 @@ uint8_t CbSwizzle(uint32_t comps, uint32_t swap) {
     }
 }
 
+// Debug texture dumps: one BC1/BC2/BC3 block (dfmt 35/36/37) → 16 RGBA8 texels, row-major.
+void DecodeBcBlock(uint32_t dfmt, const uint8_t* b, uint8_t out[16][4]) {
+    const uint8_t* c = dfmt == 35 ? b : b + 8;
+    const uint16_t c0 = uint16_t(c[0] | (c[1] << 8)), c1 = uint16_t(c[2] | (c[3] << 8));
+    uint8_t pal[4][4];
+    auto expand = [](uint16_t v, uint8_t* o) {
+        o[0] = uint8_t(((v >> 11) & 31) * 255 / 31);
+        o[1] = uint8_t(((v >> 5) & 63) * 255 / 63);
+        o[2] = uint8_t((v & 31) * 255 / 31);
+        o[3] = 255;
+    };
+    expand(c0, pal[0]);
+    expand(c1, pal[1]);
+    for (int k = 0; k < 3; ++k) {
+        if (c0 > c1 || dfmt != 35) {
+            pal[2][k] = uint8_t((2 * pal[0][k] + pal[1][k]) / 3);
+            pal[3][k] = uint8_t((pal[0][k] + 2 * pal[1][k]) / 3);
+        } else {
+            pal[2][k] = uint8_t((pal[0][k] + pal[1][k]) / 2);
+            pal[3][k] = 0;
+        }
+    }
+    pal[2][3] = 255;
+    pal[3][3] = (c0 > c1 || dfmt != 35) ? 255 : 0;
+    const uint32_t bits = uint32_t(c[4]) | (uint32_t(c[5]) << 8) | (uint32_t(c[6]) << 16) | (uint32_t(c[7]) << 24);
+    for (int i = 0; i < 16; ++i) std::memcpy(out[i], pal[(bits >> (2 * i)) & 3], 4);
+    if (dfmt == 36) { // explicit 4-bit alpha
+        for (int i = 0; i < 16; ++i) out[i][3] = uint8_t(((b[i / 2] >> ((i & 1) * 4)) & 15) * 17);
+    } else if (dfmt == 37) { // interpolated alpha
+        uint8_t a[8] = {b[0], b[1]};
+        if (a[0] > a[1])
+            for (int k = 1; k < 7; ++k) a[k + 1] = uint8_t(((7 - k) * a[0] + k * a[1]) / 7);
+        else {
+            for (int k = 1; k < 5; ++k) a[k + 1] = uint8_t(((5 - k) * a[0] + k * a[1]) / 5);
+            a[6] = 0;
+            a[7] = 255;
+        }
+        uint64_t ab = 0;
+        for (int k = 0; k < 6; ++k) ab |= uint64_t(b[2 + k]) << (8 * k);
+        for (int i = 0; i < 16; ++i) out[i][3] = a[(ab >> (3 * i)) & 7];
+    }
+}
+
 struct TexFormatInfo {
     VkFormat format = VK_FORMAT_UNDEFINED;
     uint32_t bytes = 0; // per texel, or per 4x4 block when block = true
@@ -616,15 +659,17 @@ private:
                              VkDescriptorSet& set, uint32_t max_records);
 
     // Legacy geometry pipeline (ES → GS → copy VS). The ES and the GS run as compute passes that write the
-    // ESGS / GSVS rings; those rings live in GPU buffers (only shaders read them), keyed by the V# base.
+    // ESGS / GSVS rings; those rings live in two GPU buffers (only shaders read them) sized for a whole draw:
+    // the hardware streams waves through 4 MB rings, we shade every wave of the draw at once.
     struct GsDraw {
         bool active = false;
         uint64_t aux_off = 0, aux_size = 0; // GS emit info (read by the copy VS)
         uint32_t nprim = 0, verts = 0;      // copy draw: instances × vertices
         uint32_t params[4] = {};            // ShaderKey::gs_params for the copy VS
     } gs_;
-    static constexpr uint64_t kGpuRingSize = 8ull << 20;
-    std::map<uint64_t, vk::Buffer> gpu_rings_;
+    static constexpr uint64_t kGpuRingSize = 64ull << 20;
+    vk::Buffer ring_buf_[2];                // ESGS, GSVS
+    uint64_t ring_base_[2] = {};            // guest V# base of each ring for the current draw
     uint64_t aux_off_ = 0, aux_size_ = 0;   // aux binding of the next BindShaderResources (gs_mode shaders)
     bool RunEsGs(const DrawInfo& d, const Regs& r);
     bool RunGsPass(ShaderKey key, const uint32_t* user, uint64_t aux_off, uint64_t aux_size, uint32_t groups);
@@ -1190,8 +1235,33 @@ Texture* Renderer::GetTexture(const uint32_t* t, uint32_t& kind) {
                     bc.imageExtent = {w, h, d3};
                     vkCmdCopyBufferToImage(c, ring_.buffer, tex->img.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &bc);
                     stats_.tex_uploads++;
-                    if (tiling != 8 && tiling != 31 && !micro) stats_.skip_reasons["texture uploaded without detiling"]++;
+                    if (tiling != 8 && tiling != 31 && !micro) {
+                        stats_.skip_reasons["texture uploaded without detiling"]++;
+                        TraceNote("renderer: texture 0x%llx %ux%u fmt %u/%u tiling %u type %u uploaded without detiling", (unsigned long long)addr, w, h, dfmt, nfmt, tiling, type);
+                    }
                     static const bool dump_tex = std::getenv("GR_DUMP_TEX") != nullptr;
+                    if (dump_tex && fi.block && (dfmt >= 35 && dfmt <= 37) && layers * d3 == 1) {
+                        // BC1/BC2/BC3 → RGBA8 for inspection
+                        std::vector<uint8_t> px(size_t(w) * h * 4);
+                        const uint8_t* srcp = RingPtr(off);
+                        const uint32_t row_blocks = micro ? bw : std::max(bpitch, bw);
+                        for (uint32_t by = 0; by < bh; ++by)
+                            for (uint32_t bx = 0; bx < bw; ++bx) {
+                                const uint8_t* blk = srcp + (size_t(by) * row_blocks + bx) * fi.bytes;
+                                uint8_t rgba[16][4];
+                                DecodeBcBlock(dfmt, blk, rgba);
+                                for (uint32_t k = 0; k < 16; ++k) {
+                                    const uint32_t x = bx * 4 + (k & 3), y = by * 4 + (k >> 2);
+                                    if (x < w && y < h) std::memcpy(&px[(size_t(y) * w + x) * 4], rgba[k], 4);
+                                }
+                            }
+                        std::error_code ec;
+                        fs::create_directories(ExeDir() / "textures", ec);
+                        char name[96];
+                        std::snprintf(name, sizeof name, "tex_%010llx_%llu_bc%u.png", (unsigned long long)addr,
+                                      (unsigned long long)submit_index_, dfmt - 34);
+                        stbi_write_png((ExeDir() / "textures" / name).string().c_str(), int(w), int(h), 4, px.data(), int(w * 4));
+                    }
                     if (dump_tex && !fi.block && (fi.bytes == 1 || fi.bytes == 4) && layers * d3 == 1) {
                         std::vector<uint8_t> px(size_t(w) * h * 4);
                         const uint8_t* srcp = RingPtr(off);
@@ -1332,9 +1402,9 @@ bool Renderer::BindShaderResources(ShaderEntry* e, const std::vector<uint32_t>& 
             const uint32_t stride = (d[1] >> 16) & 0x3FFF;
             // geometry-pipeline rings stay on the GPU
             bool ring_bound = false;
-            for (auto& [rb, rbuf] : gpu_rings_)
-                if (base >= rb && base < rb + kGpuRingSize && ((base - rb) & 255) == 0) {
-                    bufs[i + 1] = {rbuf.buffer, base - rb, kGpuRingSize - (base - rb)};
+            for (int k = 0; k < 2; ++k)
+                if (ring_base_[k] && base == ring_base_[k] && ring_buf_[k].buffer) {
+                    bufs[i + 1] = {ring_buf_[k].buffer, 0, kGpuRingSize};
                     wr.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
                     wr.pBufferInfo = &bufs[i + 1];
                     writes.push_back(wr);
@@ -1584,13 +1654,16 @@ bool Renderer::RunEsGs(const DrawInfo& d, const Regs& r) {
     if (!tbl || !SafeCopy(t, tbl, sizeof t)) { Skip("geometry pipeline: ring table"); return false; }
     const uint64_t esgs = uint64_t(t[0x08]) | (uint64_t(t[0x09] & 0xFF) << 32);
     const uint64_t gsvs = uint64_t(t[0x10]) | (uint64_t(t[0x11] & 0xFF) << 32);
-    for (uint64_t base : {esgs, gsvs}) {
-        if (!base) { Skip("geometry pipeline: ring table"); return false; }
-        if (!gpu_rings_.count(base)) {
-            gpu_rings_[base] = dev_.CreateBuffer(kGpuRingSize, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, false);
-            TraceNote("renderer: geometry ring at 0x%llx", (unsigned long long)base);
-        }
+    if (!esgs || !gsvs || esgs == gsvs) { Skip("geometry pipeline: ring table"); return false; }
+    if (uint64_t((count + 63) / 64) * 64 * es_item * 4 > kGpuRingSize ||
+        uint64_t((nprim + 63) / 64) * 64 * gsvs_item * 4 > kGpuRingSize) {
+        Skip("geometry pipeline: draw too large for the rings");
+        return false;
     }
+    for (int k = 0; k < 2; ++k)
+        if (!ring_buf_[k].buffer) ring_buf_[k] = dev_.CreateBuffer(kGpuRingSize, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, false);
+    ring_base_[0] = esgs;
+    ring_base_[1] = gsvs;
 
     // ES pass: aux = [count, indices...]
     const uint64_t es_aux = Alloc(uint64_t(count + 1) * 4, 16);
