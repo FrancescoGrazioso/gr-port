@@ -1,0 +1,8 @@
+build/
+build_cfg.log
+gr_port_report.txt
+gr_port_trace.txt
+gr_port_report.txt
+*.rdc
+/capture/
+/frames/
