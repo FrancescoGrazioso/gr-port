@@ -154,9 +154,9 @@ uint32_t MicroIndex(uint32_t x, uint32_t y, uint32_t bpp, bool display) {
 
 // 1D (micro-)tiled surface → linear rows of `w` elements. Returns false on a fault.
 bool Detile1D(uint8_t* dst, uint64_t src, uint32_t w, uint32_t h, uint32_t pitch, uint32_t bpp, bool display,
-              uint32_t slices) {
+              uint32_t slices, uint64_t slice_stride = 0) {
     const uint32_t pitch_al = (pitch + 7) & ~7u, h_al = (h + 7) & ~7u;
-    const uint64_t slice_bytes = uint64_t(pitch_al) * h_al * bpp;
+    const uint64_t slice_bytes = slice_stride ? slice_stride : uint64_t(pitch_al) * h_al * bpp;
     uint32_t lut[64];
     for (uint32_t y = 0; y < 8; ++y)
         for (uint32_t x = 0; x < 8; ++x) lut[y * 8 + x] = MicroIndex(x, y, bpp, display);
@@ -177,6 +177,44 @@ bool Detile1D(uint8_t* dst, uint64_t src, uint32_t w, uint32_t h, uint32_t pitch
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         return false;
     }
+}
+
+// Mip chain of a 1D-thin (micro-tiled) texture as the GPU lays it out (shadPS4 ComputeImageSize): level i
+// is `pitch >> i` wide (rounded up to a power of two with pow2pad, in blocks for BC formats), padded to
+// 8x8 elements and widened until a slice is a multiple of 256 bytes; levels follow each other, each one
+// holding every slice.
+struct MipLevel {
+    uint64_t offset = 0, slice_bytes = 0;
+    uint32_t pitch = 0;      // elements (blocks), multiple of 8
+    uint32_t w = 0, h = 0;   // texels of this level
+    uint32_t bw = 0, bh = 0; // elements to detile
+};
+
+uint32_t CeilPow2(uint32_t v) { uint32_t p = 1; while (p < v) p <<= 1; return p; }
+
+uint64_t MicroMipChain(uint32_t w, uint32_t h, uint32_t pitch, uint32_t levels, uint32_t slices, uint32_t bpp,
+                       bool block, bool pow2, MipLevel* out) {
+    uint64_t total = 0;
+    for (uint32_t i = 0; i < levels; ++i) {
+        MipLevel& m = out[i];
+        m.w = std::max(w >> i, 1u);
+        m.h = std::max(h >> i, 1u);
+        m.bw = block ? (m.w + 3) / 4 : m.w;
+        m.bh = block ? (m.h + 3) / 4 : m.h;
+        uint32_t pw = std::max(pitch >> i, 1u), ph = m.h;
+        if (block) { pw = (pw + 3) / 4; ph = (ph + 3) / 4; }
+        pw = std::max(pw, 1u);
+        ph = std::max(ph, 1u);
+        if (pow2) { pw = CeilPow2(pw); ph = CeilPow2(ph); }
+        uint32_t pal = (pw + 7) & ~7u;
+        const uint32_t hal = (ph + 7) & ~7u;
+        while ((uint64_t(pal) * hal * bpp) % 256) pal += 8;
+        m.pitch = pal;
+        m.slice_bytes = uint64_t(pal) * hal * bpp;
+        m.offset = total;
+        total += m.slice_bytes * slices;
+    }
+    return total;
 }
 
 // ---------------------------------------------------------------------------------------------------------
@@ -449,6 +487,7 @@ struct Texture {
     uint64_t src_gen = ~0ull;          // render-target generation last copied
     uint64_t mem_hash = 0;             // guest-memory content hash (uploaded textures)
     uint32_t layers = 1;
+    uint32_t levels = 1;               // mip levels uploaded from guest memory
     uint64_t last_check_submit = ~0ull;
 };
 
@@ -1141,7 +1180,16 @@ Texture* Renderer::GetTexture(const uint32_t* t, uint32_t& kind) {
         ci.imageType = itype;
         ci.format = fi.format;
         ci.extent = {w, h, d3};
-        ci.mipLevels = 1;
+        // Mip chains are uploaded for micro-tiled 2D / cube / array textures (the T# last_level).
+        uint32_t levels = 1;
+        if (!src_rt && type != 10 && (tiling == 13 || tiling == 9 || tiling == 5)) {
+            const uint32_t last = (t[3] >> 16) & 0xF;
+            uint32_t maxl = 1;
+            while ((std::max(w, h) >> maxl) > 0) ++maxl;
+            levels = std::min(last + 1, maxl);
+        }
+        nt.levels = levels;
+        ci.mipLevels = levels;
         ci.arrayLayers = layers;
         ci.samples = VK_SAMPLE_COUNT_1_BIT;
         ci.tiling = VK_IMAGE_TILING_OPTIMAL;
@@ -1165,11 +1213,11 @@ Texture* Renderer::GetTexture(const uint32_t* t, uint32_t& kind) {
         vci.format = fi.format;
         vci.components = {DstSel(t[3] & 7), DstSel((t[3] >> 3) & 7), DstSel((t[3] >> 6) & 7), DstSel((t[3] >> 9) & 7)};
         if (src_rt && src_rt->depth && !from_stencil) vci.components = {VK_COMPONENT_SWIZZLE_R, VK_COMPONENT_SWIZZLE_R, VK_COMPONENT_SWIZZLE_R, VK_COMPONENT_SWIZZLE_R};
-        vci.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, layers};
+        vci.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, levels, 0, layers};
         vkCreateImageView(dev_.device(), &vci, nullptr, &nt.view);
         Barrier(c, nt.img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
         VkClearColorValue zero{};
-        VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, layers};
+        VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, levels, 0, layers};
         if (!fi.block) vkCmdClearColorImage(c, nt.img.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &zero, 1, &range);
         tex = &(textures_[key] = nt);
         stats_.textures++;
@@ -1213,27 +1261,51 @@ Texture* Renderer::GetTexture(const uint32_t* t, uint32_t& kind) {
         const uint32_t layers = tex->layers;
         const uint32_t d3 = type == 10 ? depth : 1;
         const bool micro = tiling == 13 || tiling == 9 || tiling == 5;
-        const uint64_t src_bytes = micro ? uint64_t((bpitch + 7) & ~7u) * ((bh + 7) & ~7u) * fi.bytes * layers * d3
-                                         : uint64_t(std::max(bpitch, bw)) * bh * fi.bytes * layers * d3;
-        const uint64_t bytes = micro ? uint64_t(bw) * bh * fi.bytes * layers * d3 : src_bytes;
+        MipLevel mips[16];
+        const uint32_t nlev = micro ? std::min(tex->levels, 16u) : 1;
+        const bool pow2 = micro && ((t[3] >> 25) & 1) != 0;
+        uint64_t src_bytes = micro ? MicroMipChain(w, h, pitch, nlev, layers * d3, fi.bytes, fi.block, pow2, mips)
+                                   : uint64_t(std::max(bpitch, bw)) * bh * fi.bytes * layers * d3;
+        uint64_t bytes = src_bytes;
+        if (micro) {
+            bytes = 0;
+            for (uint32_t i = 0; i < nlev; ++i) bytes += uint64_t(mips[i].bw) * mips[i].bh * fi.bytes * layers * d3;
+        }
         if (bytes == 0 || src_bytes > (96ull << 20)) {
             Skip("texture too large");
         } else if (Readable(addr, size_t(src_bytes))) {
             const uint64_t hsh = SampleHash(addr, src_bytes);
             if (is_new || hsh != tex->mem_hash) {
                 tex->mem_hash = hsh;
-                const uint64_t off = Alloc(bytes, 16);
+                const uint64_t off = Alloc(bytes + 16ull * nlev, 16);
                 if (off != UINT64_MAX) {
-                    if (micro) Detile1D(RingPtr(off), addr, bw, bh, bpitch, fi.bytes, tiling == 9, layers * d3);
-                    else SafeCopy(RingPtr(off), addr, size_t(bytes));
                     Barrier(c, tex->img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
-                    VkBufferImageCopy bc{};
-                    bc.bufferOffset = off;
-                    bc.bufferRowLength = micro ? bw * (fi.block ? 4 : 1) : std::max(pitch, w);
-                    bc.bufferImageHeight = micro ? bh * (fi.block ? 4 : 1) : 0;
-                    bc.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, layers};
-                    bc.imageExtent = {w, h, d3};
-                    vkCmdCopyBufferToImage(c, ring_.buffer, tex->img.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &bc);
+                    if (micro) {
+                        VkBufferImageCopy bcs[16]{};
+                        uint64_t dst = off;
+                        for (uint32_t i = 0; i < nlev; ++i) {
+                            const MipLevel& m = mips[i];
+                            Detile1D(RingPtr(dst), addr + m.offset, m.bw, m.bh, m.pitch, fi.bytes, tiling == 9,
+                                     layers * d3, m.slice_bytes);
+                            VkBufferImageCopy& bc = bcs[i];
+                            bc.bufferOffset = dst;
+                            bc.bufferRowLength = m.bw * (fi.block ? 4 : 1);
+                            bc.bufferImageHeight = m.bh * (fi.block ? 4 : 1);
+                            bc.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, i, 0, layers};
+                            bc.imageExtent = {m.w, m.h, d3};
+                            dst += uint64_t(m.bw) * m.bh * fi.bytes * layers * d3;
+                            dst = (dst + 15) & ~15ull;
+                        }
+                        vkCmdCopyBufferToImage(c, ring_.buffer, tex->img.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, nlev, bcs);
+                    } else {
+                        SafeCopy(RingPtr(off), addr, size_t(bytes));
+                        VkBufferImageCopy bc{};
+                        bc.bufferOffset = off;
+                        bc.bufferRowLength = std::max(pitch, w);
+                        bc.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, layers};
+                        bc.imageExtent = {w, h, d3};
+                        vkCmdCopyBufferToImage(c, ring_.buffer, tex->img.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &bc);
+                    }
                     stats_.tex_uploads++;
                     if (tiling != 8 && tiling != 31 && !micro) {
                         stats_.skip_reasons["texture uploaded without detiling"]++;

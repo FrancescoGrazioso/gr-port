@@ -323,18 +323,17 @@ unsupported types, thunk self-test passed, Vulkan window at 60 Hz.
    at param4 = a 2x2 UV transform of the mesh UV (ES, cbuffer dwords 0x1c-0x2d). The PS adds
    star * diffuse.a * constant to diffuse * lighting; the body colour must come from the material
    constants or a later pass.
-   **Root cause found (RenderDoc, same day):** the cat's UVs are correct (param0 = diffuse UV,
-   param4 = star UV at 2x its frequency), but guest textures are uploaded with **mip 0 only**
-   (the Vulkan image has 1 level even when the T# says levels 0-8). The cat covers ~100 px, so the
-   256x256 starfield is minified without mips and aliases into large black/white blotches. Every
-   distant textured surface has the same problem. Next step: upload all levels. Layout (shadPS4
-   `ComputeImageSize`, texture_cache/tile.h): level i uses `pitch >> i` (rounded up to a power of
-   two when T# `pow2pad` is set; BC sizes in blocks), 1D-thin levels are padded to 8x8 elements and
-   grown in pitch until the size is a multiple of 256 bytes, levels are stored one after another
-   (each level holding all array layers), and Pow2Bcn64/128ImageTable covers square pow2 BC
-   textures. Last level = T# dword 3 bits 16-19 (`last_level`); macro-tiled mips fall back to
-   micro tiling below the macro-tile extents. Detile each level with Detile1D and copy it into
-   mip i of a multi-level image (image view and sampler maxLod already allow it).
+   **Mip levels (2026-10-19):** micro-tiled textures (1D thin, tilings 5/9/13) now upload their
+   whole mip chain (T# last_level), laid out as in shadPS4 `ComputeImageSize`: level i is
+   `pitch >> i` (power-of-two padded with pow2pad, in blocks for BC), padded to 8x8 elements and
+   widened until a slice is a multiple of 256 bytes, levels stored one after another with every
+   slice inside each level (`MicroMipChain`). Distant ground is visibly less aliased. Linear and
+   macro-tiled textures still get mip 0 only; the square pow2 BC tables (Pow2Bcn64/128ImageTable)
+   are not used yet, so check those textures if something looks off.
+   This did **not** fix the cat: its UVs are right (param0 = diffuse UV, param4 = star UV at 2x),
+   and the diffuse body is grey-blue with high alpha, to which the PS adds the stars. The black
+   body seen on PS4 must come from the material constants (s[12:15] colour at cbuffer dword 0x14,
+   star strength at 0x11) or the lighting terms; read those constants for this draw next.
    The missing movie between the apple and gameplay is `mp4/ep00-01c.mp4` (AvPlayer is a stub).
    **Kat investigation, 2026-10-17 (afternoon), state when stopped:**
    - Auto-exposure fixed: the game reads the 1x1 average-luminance render target on the CPU
