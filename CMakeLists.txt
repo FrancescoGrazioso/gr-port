@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.24)
-project(gr_port LANGUAGES CXX)
+project(gr_port LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -8,6 +8,15 @@ set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 if(MSVC)
   add_compile_options(/W4 /permissive- /utf-8 /wd4100)
   add_compile_definitions(_CRT_SECURE_NO_WARNINGS NOMINMAX WIN32_LEAN_AND_MEAN)
+endif()
+
+# ---- third-party: LibAtrac9 (MIT, external/libatrac9) for NGS2 ATRAC9 voices
+file(GLOB ATRAC9_SOURCES CONFIGURE_DEPENDS ${CMAKE_SOURCE_DIR}/external/libatrac9/*.c)
+add_library(atrac9 STATIC ${ATRAC9_SOURCES})
+target_include_directories(atrac9 PUBLIC ${CMAKE_SOURCE_DIR}/external/libatrac9)
+target_compile_definitions(atrac9 PUBLIC COMPILING_DLL)
+if(MSVC)
+  target_compile_options(atrac9 PRIVATE /W0)
 endif()
 
 # ---- shared code -------------------------------------------------------------
@@ -100,6 +109,7 @@ if(WIN32)
     loader/kernel/savedata.cpp
     loader/kernel/overlay.cpp
     loader/kernel/audio_out.cpp
+    loader/kernel/ngs2.cpp
     loader/gpu/gpu.cpp
     loader/gpu/gnm_driver.cpp
     loader/gpu/videoout.cpp
@@ -110,7 +120,7 @@ if(WIN32)
     loader/gpu/renderdoc.cpp
   )
   target_include_directories(gr_port PRIVATE loader ${stb_SOURCE_DIR} external/renderdoc)
-  target_link_libraries(gr_port PRIVATE gr_common Vulkan::Headers winmm xinput dbghelp mfplat mfreadwrite mfuuid shlwapi ole32
+  target_link_libraries(gr_port PRIVATE gr_common atrac9 Vulkan::Headers winmm xinput dbghelp mfplat mfreadwrite mfuuid shlwapi ole32
                         glslang glslang-default-resource-limits)
   if(TARGET SPIRV)
     target_link_libraries(gr_port PRIVATE SPIRV)

@@ -46,6 +46,8 @@ GPU work is split into submissions that alternate between rendering and flips, s
 | `GR_FIND_VS=<hex>` | logs the submissions that use a vertex shader |
 | `GR_DEBUG_NODEPTH=<hex VS>` / `GR_DEBUG_NOKILL=<hex PS>` | disables the depth test / pixel kill for one shader |
 | `GR_DEBUG_UNREADABLE_ONE=1` | fills textures that cannot be read with 1.0 instead of 0 |
+| `GR_AUDIO_DUMP=<file.wav>` | records the mixed sceAudioOut output (works with `--mute`), so a test can check that sound is produced |
+| `GR_NGS2_LOG=1` | NGS2 racks, patches, voice setups, matrices, events and 2-second level statistics (sampler, mixer, master peaks) in the trace |
 | `GR_WATCH_RTS=1` | logs the first CPU access to every render target's guest memory |
 | `GR_DMA_WATCH=<hex address>` | logs `DMA_DATA` packets that write that address |
 | `GR_SETVS_STATS=1`, `GR_DEBUG_SETVS=<hex>`, `GR_SETVS_FROM=<symbol text>` | vertex-shader bind statistics / backtrace of who binds a VS / VS bound while the guest stack contains a symbol |

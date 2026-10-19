@@ -6,7 +6,7 @@
       "args": [],
       "input": "",
       "seconds": 45,
-      "frames": [300, 600, 900, 1200, 1500]
+      "frames": [300, 600, 1500]
     },
     "opening": {
       "description": "Full prologue: New Game, falling apple (taps), comic, first gameplay",

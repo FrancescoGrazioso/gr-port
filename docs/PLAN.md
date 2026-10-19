@@ -453,8 +453,25 @@ decoder thread keeps two frames ahead in four guest NV12 buffers (allocateTextur
 GetVideoDataEx hands out a frame once the clock since Start reaches its timestamp. The intro (Japan
 Studio, Bluepoint, title animation: `subtitlemovie_us.mp4`, 19 s) and the 161 s `ep00-01c` movie
 after the apple play with their subtitles; CROSS skips them. Audio frames are decoded and handed
-out by GetAudioData (the game's MovieAudioThread pushes them to sceAudioOut), but sceAudioOut is
-still silent: audio output is the next big item.
+out by GetAudioData (the game's MovieAudioThread pushes them to sceAudioOut).
+
+**Audio (2026-10-19).** sceAudioOut ports are mixed into one shared WASAPI stream
+(`audio_out.cpp`: 48 kHz float stereo, per-port rings, resampling, 8-channel downmix, volume).
+The game's sound engine ("sndx") renders through libSceNgs2, now implemented in `ngs2.cpp`:
+- graph: sampler rack 0x1000 → submixer 0x2000.0 → mastering 0x3000.0, reverb 0x2001.0 → submixer;
+  patches may target a rack handle (meaning its voice 0); matrices are levels[out * inputs + in];
+- formats: 0x14 = PCM 24-bit LE (sound effects, mono/stereo), 0x40 = ATRAC9 (music, streamed in
+  ~32 KB blocks from a ring at 0x2007b7980; config word 0xFE740DF0 = bytes FE 74 0D F0), decoded
+  with LibAtrac9 (external/libatrac9, MIT). ATRAC9 frames sit in fixed-size superframes: skip the
+  padding after each superframe or the decoder derails after a few frames;
+- streams: the game sends Play, Pause, then Resume once the voice has pre-decoded (a paused voice
+  must fill its codec cache, i.e. decodedDataSize > 0), and keeps appending blocks while watching
+  numDecodedSamples / decodedDataSize; a voice that stops advancing is stopped by the game;
+- 10 render buffers: 0 = mastering voice 0 (8 ch float, 256 frames), 1-4 mono, 5-8 stereo,
+  9 = 8 ch; buffer i is written from mastering voice i;
+- not modelled yet: envelopes, filters, reverb (silent), port delays, voice callbacks.
+Courtyard: continuous music/ambience and effects in the mix (checked with GR_AUDIO_DUMP; levels
+look low, around -44 dBFS RMS, to be compared with the real game).
 
 Working rule: if a subsystem blocks progress, close it with a logging stub (the mechanism exists)
 and move on. `gr_port_report.txt` lists the functions that are still stubs, per library.
