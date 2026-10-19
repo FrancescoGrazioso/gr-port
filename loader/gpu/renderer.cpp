@@ -1421,7 +1421,16 @@ bool Renderer::BindShaderResources(ShaderEntry* e, const std::vector<uint32_t>& 
         if (r.kind == ResourceSlot::kTexture) {
             uint32_t kind = 0;
             Texture* tx = nullptr;
-            if (!(d[0] | d[1] | d[2] | d[3])) {
+            // Debug (GR_DEBUG_BLACK_TEX=<hex shader>:<resource>): replaces one texture of one shader with black
+            static const std::pair<uint64_t, size_t> black_tex = [] {
+                const char* e = std::getenv("GR_DEBUG_BLACK_TEX");
+                if (!e) return std::pair<uint64_t, size_t>{0, 0};
+                char* end = nullptr;
+                const uint64_t sh = std::strtoull(e, &end, 16);
+                return std::pair<uint64_t, size_t>{sh, end && *end == ':' ? size_t(std::strtoul(end + 1, nullptr, 10)) : 0};
+            }();
+            const bool force_black = black_tex.first && black_tex.first == e->t->key.code && black_tex.second == i;
+            if (force_black || !(d[0] | d[1] | d[2] | d[3])) {
                 // null T#: GCN returns zeros, so bind a 1x1 black texture
                 {
                     static std::set<std::pair<uint64_t, size_t>> seen;

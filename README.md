@@ -139,6 +139,7 @@ always runs the game exactly as shipped.
 - [GR2fork](https://github.com/junminlee2004/GR2fork): the shadPS4 fork for Gravity Rush 2.
 - [glslang](https://github.com/KhronosGroup/glslang), [Capstone](https://github.com/capstone-engine/capstone),
   [stb](https://github.com/nothings/stb), [Vulkan-Headers](https://github.com/KhronosGroup/Vulkan-Headers),
+  [LibAtrac9](https://github.com/Thealexbarney/LibAtrac9) (ATRAC9 decoding),
   [RenderDoc](https://renderdoc.org/) and [Ghidra](https://ghidra-sre.org/).
 
 ## Disclaimer

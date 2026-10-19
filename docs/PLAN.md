@@ -472,6 +472,10 @@ The game's sound engine ("sndx") renders through libSceNgs2, now implemented in 
 - not modelled yet: envelopes, filters, reverb (silent), port delays, voice callbacks.
 Courtyard: continuous music/ambience and effects in the mix (checked with GR_AUDIO_DUMP; levels
 look low, around -44 dBFS RMS, to be compared with the real game).
+Next session: with audio running the game's timing shifted, so `opening` (frame 3300), `movie`
+(4300) and `ep03` (3400) now capture the same scenes at slightly different moments; refresh those
+references (`run_scenario.ps1 opening movie ep03 -SaveReference`) and prefer stable frames. For
+the cat, `GR_DEBUG_BLACK_TEX=24e622a00:7` (stars) or `:0` (diffuse) isolates the shader terms.
 
 Working rule: if a subsystem blocks progress, close it with a logging stub (the mechanism exists)
 and move on. `gr_port_report.txt` lists the functions that are still stubs, per library.
