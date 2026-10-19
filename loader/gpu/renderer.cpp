@@ -2237,9 +2237,10 @@ void Renderer::Flip(int32_t index) {
                            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &b, VK_FILTER_NEAREST);
         }
         Barrier(c, out_, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
-        const bool dump = !cfg.dump_dir.empty() && cfg.dump_every && stats_.flips >= cfg.dump_first &&
-                          (stats_.flips - cfg.dump_first) % cfg.dump_every == 0 &&
-                          uint64_t(w) * h * 4 <= readback_.size;
+        const bool listed = std::find(cfg.dump_at.begin(), cfg.dump_at.end(), uint32_t(stats_.flips)) != cfg.dump_at.end();
+        const bool dump = !cfg.dump_dir.empty() && uint64_t(w) * h * 4 <= readback_.size &&
+                          (listed || (cfg.dump_every && stats_.flips >= cfg.dump_first &&
+                                      (stats_.flips - cfg.dump_first) % cfg.dump_every == 0));
         const bool cpu = cpu_frames_ && uint64_t(w) * h * 4 <= readback_.size;
         if (dump || cpu) {
             VkBufferImageCopy bc{};
@@ -2274,6 +2275,12 @@ void Renderer::Flip(int32_t index) {
             stbi_write_png(path.c_str(), int(w), int(h), 4, px.data(), int(w * 4));
             stats_.dumped++;
             TraceNote("renderer: frame %llu written to %s", (unsigned long long)stats_.flips, path.c_str());
+            // test runs (tools/run_scenario.ps1) end as soon as the last requested frame exists
+            if (cfg.exit_after_dumps && listed && uint32_t(stats_.flips) == cfg.dump_at.back()) {
+                std::printf("renderer: last requested frame written, exiting\n");
+                std::fflush(nullptr);
+                TerminateProcess(GetCurrentProcess(), 0);
+            }
         }
     }
 }

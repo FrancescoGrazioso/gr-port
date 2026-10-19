@@ -11,6 +11,7 @@
 
 #include "guest.h"
 #include "kernel.h"
+#include "overlay.h"
 
 namespace fs = std::filesystem;
 
@@ -28,6 +29,8 @@ struct File {
     fs::path host_path;
     std::vector<std::string> entries; // directory listing
     size_t dir_pos = 0;
+    std::shared_ptr<const ArchiveOverlay> ov; // development overlay of a game archive (overlay.h)
+    uint64_t pos = 0;                         // file position when ov is set
 };
 
 std::mutex g_files;
@@ -97,6 +100,8 @@ int Open(const std::string& path, uint32_t flags) {
             return -e;
         }
         if (flags & O_APPEND_) SetFilePointer(f->h, 0, nullptr, FILE_END);
+        // game archives may be presented through the opt-in development overlay (never written)
+        if (ro && host.extension() == ".psarc") f->ov = GetArchiveOverlay(host);
     }
     std::lock_guard<std::mutex> lk(g_files);
     for (size_t i = 3; i < g_fds.size(); ++i)
@@ -126,6 +131,12 @@ int64_t Read(uint64_t fd, uint64_t buf, uint64_t n, int64_t offset /* -1 = curre
     File* f = Get(fd);
     if (!f) return -kEBADF;
     if (f->is_dir) return -kEISDIR;
+    if (f->ov) {
+        const uint64_t at = offset >= 0 ? uint64_t(offset) : f->pos;
+        const uint64_t got = at < f->ov->Size() ? OverlayRead(*f->ov, f->h, at, Ptr<uint8_t>(buf), n) : 0;
+        if (offset < 0) f->pos += got;
+        return int64_t(got);
+    }
     DWORD got = 0;
     OVERLAPPED ov{};
     if (offset >= 0) {
@@ -172,6 +183,12 @@ int64_t Write(uint64_t fd, uint64_t buf, uint64_t n, int64_t offset) {
 int64_t Seek(uint64_t fd, int64_t off, int whence) {
     File* f = Get(fd);
     if (!f || f->is_dir) return -kEBADF;
+    if (f->ov) {
+        const int64_t base = whence == 1 ? int64_t(f->pos) : whence == 2 ? int64_t(f->ov->Size()) : 0;
+        if (base + off < 0) return -kEINVAL;
+        f->pos = uint64_t(base + off);
+        return int64_t(f->pos);
+    }
     LARGE_INTEGER d, out;
     d.QuadPart = off;
     const DWORD method = whence == 1 ? FILE_CURRENT : whence == 2 ? FILE_END : FILE_BEGIN;
@@ -203,7 +220,9 @@ int StatPath(const std::string& path, uint64_t st) {
     const auto status = fs::status(host, ec);
     if (ec || !fs::exists(status)) return kENOENT;
     const bool dir = fs::is_directory(status);
-    const uint64_t size = dir ? 0 : fs::file_size(host, ec);
+    uint64_t size = dir ? 0 : fs::file_size(host, ec);
+    if (!dir && ro && host.extension() == ".psarc")
+        if (auto ov = GetArchiveOverlay(host)) size = ov->Size();
     FillStat(st, size, dir, 1500000000);
     return 0;
 }
@@ -215,7 +234,7 @@ int StatFd(uint64_t fd, uint64_t st) {
     if (f->is_dir) { FillStat(st, 0, true, 1500000000); return 0; }
     LARGE_INTEGER sz;
     GetFileSizeEx(f->h, &sz);
-    FillStat(st, uint64_t(sz.QuadPart), false, 1500000000);
+    FillStat(st, f->ov ? f->ov->Size() : uint64_t(sz.QuadPart), false, 1500000000);
     return 0;
 }
 

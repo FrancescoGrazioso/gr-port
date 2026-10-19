@@ -25,6 +25,8 @@
 #include "vmem.h"
 #include "hle.h"
 #include "kernel/kernel.h"
+#include "kernel/overlay.h"
+#include "kernel/audio_out.h"
 #include "linker.h"
 #include "nid.h"
 #include "tls.h"
@@ -108,7 +110,11 @@ int main(int argc, char** argv) {
     if (argc < 2) {
         std::fprintf(stderr,
                      "usage: %s <uroot_dir> [--run] [--no-window] [--timeout S] [--trace N] [--names f.txt]"
-                     " [--report out.txt] [--frames N]\n",
+                     " [--report out.txt] [--frames N]\n"
+                     "  [--mute]\n"
+                     "  testing: [--skip-opening] [--warp MISSION] [--mods DIR] [--savedata DIR]"
+                     " [--dump-at F1,F2,...] [--dump-dir DIR] [--exit-after-dumps]\n"
+                     "  (see docs/DEBUGGING.md and docs/MODDING_AND_TESTING.md)\n",
                      argv[0]);
         return 1;
     }
@@ -122,7 +128,11 @@ int main(int argc, char** argv) {
     double trace_after = 0;
     int64_t capture_submission = -2; // -2 = capture disabled, -1 = dump shaders only
     uint32_t dump_every = 0, dump_first = 0;
+    std::vector<uint32_t> dump_at;
+    fs::path dump_dir = ExeDir() / "frames";
+    bool exit_after_dumps = false;
     bool gpu_enabled = true;
+    fs::path savedata_dir = ExeDir() / "savedata";
     std::vector<std::string> trace_lle;
     for (int i = 2; i < argc; ++i) {
         const std::string a = argv[i];
@@ -138,7 +148,26 @@ int main(int argc, char** argv) {
         else if (a == "--capture" && i + 1 < argc) capture_submission = std::atoll(argv[++i]);
         else if (a == "--dump-frames" && i + 1 < argc) dump_every = uint32_t(std::atoi(argv[++i]));
         else if (a == "--dump-first" && i + 1 < argc) dump_first = uint32_t(std::atoi(argv[++i]));
+        else if (a == "--dump-at" && i + 1 < argc) {
+            for (const char* p = argv[++i]; *p;) { // comma-separated flip numbers
+                char* end = nullptr;
+                const unsigned long v = std::strtoul(p, &end, 10);
+                if (end == p) break;
+                dump_at.push_back(uint32_t(v));
+                p = end;
+                while (*p == ',') ++p;
+            }
+            std::sort(dump_at.begin(), dump_at.end());
+        }
+        else if (a == "--dump-dir" && i + 1 < argc) dump_dir = fs::absolute(argv[++i]);
+        else if (a == "--exit-after-dumps") exit_after_dumps = true;
         else if (a == "--no-gpu") gpu_enabled = false;
+        // development / testing (docs/MODDING_AND_TESTING.md): nothing on disk is modified
+        else if (a == "--mods" && i + 1 < argc) gr::kernel::SetOverlayModsDir(fs::absolute(argv[++i]));
+        else if (a == "--warp" && i + 1 < argc) gr::kernel::SetOverlayWarp(argv[++i]);
+        else if (a == "--skip-opening") gr::kernel::SetOverlaySkipOpening(true);
+        else if (a == "--mute") gr::kernel::AudioOutSetMuted(true);
+        else if (a == "--savedata" && i + 1 < argc) savedata_dir = fs::absolute(argv[++i]);
         else if (a == "--trace-lle" && i + 1 < argc) {
             std::string list = argv[++i];
             for (size_t p = 0; p < list.size();) {
@@ -213,7 +242,7 @@ int main(int argc, char** argv) {
 
     gr::Runtime& rt = gr::Rt();
     rt.app0 = root;
-    rt.savedata = ExeDir() / "savedata";
+    rt.savedata = savedata_dir;
     rt.linker = &linker;
     rt.tls = &tls;
     const auto& eboot = *linker.Modules()[0];
@@ -234,7 +263,9 @@ int main(int argc, char** argv) {
         rc.enabled = gpu_enabled;
         rc.dump_every = dump_every;
         rc.dump_first = dump_first;
-        if (dump_every) rc.dump_dir = (ExeDir() / "frames").string();
+        rc.dump_at = dump_at;
+        rc.exit_after_dumps = exit_after_dumps && !dump_at.empty();
+        if (dump_every || !dump_at.empty()) rc.dump_dir = dump_dir.string();
         gr::gpu::RendererConfigure(rc);
     }
     if (run) {

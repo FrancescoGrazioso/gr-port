@@ -1,0 +1,40 @@
+{
+  "_comment": "Test scenarios for tools/run_scenario.ps1. See docs/MODDING_AND_TESTING.md. Times are seconds since start; frames are guest flip numbers.",
+  "scenarios": {
+    "title": {
+      "description": "Boot to the title menu",
+      "args": [],
+      "input": "",
+      "seconds": 45,
+      "frames": [300, 600, 900, 1200, 1500]
+    },
+    "opening": {
+      "description": "Full prologue: New Game, falling apple (taps), comic, first gameplay",
+      "args": [],
+      "input": "26:UP,27.5:CROSS,@30-420/3:CROSS:0.2",
+      "seconds": 170,
+      "frames": [2100, 2700, 3300, 4800]
+    },
+    "movie": {
+      "description": "The ep00-01c movie after the falling apple (AvPlayer)",
+      "args": [],
+      "input": "26:UP,27.5:CROSS,@30-72/3:CROSS:0.2",
+      "seconds": 130,
+      "frames": [3700, 4000, 4300]
+    },
+    "courtyard": {
+      "description": "Episode 1 courtyard (Kat, Dusty, pigeons) with the prologue skipped",
+      "args": ["--skip-opening"],
+      "input": "26:UP,27.5:CROSS,@30-100/2:CROSS:0.2",
+      "seconds": 115,
+      "frames": [2400, 3600]
+    },
+    "ep03": {
+      "description": "Warp to mission ep03_a (a dialogue with Dusty, then the Hekseville alleys)",
+      "args": ["--skip-opening", "--warp", "ep03_a"],
+      "input": "26:UP,27.5:CROSS,@30-100/2:CROSS:0.2",
+      "seconds": 120,
+      "frames": [2400, 3400]
+    }
+  }
+}

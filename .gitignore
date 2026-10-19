@@ -6,3 +6,4 @@ gr_port_report.txt
 *.rdc
 /capture/
 /frames/
+/mods/

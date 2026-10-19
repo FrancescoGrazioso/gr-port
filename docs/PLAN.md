@@ -434,6 +434,28 @@ code. Possible steps, each useful by itself:
    already know best), until the original code is only a shrinking fallback.
 This phase is open-ended; how far it goes is part of the experiment.
 
+**Testing infrastructure (2026-10-19).** Replaying the prologue for every test does not scale, so
+gr-port has opt-in shortcuts built on an in-memory overlay of the game archives: `--skip-opening`,
+`--warp MISSION` (start New Game at any main mission), `--mods DIR`, plus `--savedata`, `--dump-at`
+and `--exit-after-dumps`. `tools/run_scenario.ps1` runs named scenarios (`tools/scenarios.json`)
+and compares frames with reference captures. The original files are never modified, the default
+command line runs the game as shipped, and the repository holds only search/replace rules, never game
+code: see [MODDING_AND_TESTING.md](MODDING_AND_TESTING.md). Real saves (the game autosaves at the
+start of each episode except `ep01_a`) are the next checkpoint mechanism; emulator-level save states
+are not planned.
+
+**Movies (2026-10-19).** `loader/kernel/avplayer.cpp` now decodes for real. The game passes a path
+inside its archives (`mp4/ep00-01c.mp4`) plus file callbacks (SceAvPlayerFileReplacement at init
+data +40: open, close, readOffset, size); the player thread reads the whole file through them,
+opens it with an IMFSourceReader from memory (H.264 → NV12, AAC → PCM16) and fires READY. A host
+decoder thread keeps two frames ahead in four guest NV12 buffers (allocateTexture, pitch aligned to
+64, height to 16, crop offsets for the padding, as the real library and shadPS4 do);
+GetVideoDataEx hands out a frame once the clock since Start reaches its timestamp. The intro (Japan
+Studio, Bluepoint, title animation: `subtitlemovie_us.mp4`, 19 s) and the 161 s `ep00-01c` movie
+after the apple play with their subtitles; CROSS skips them. Audio frames are decoded and handed
+out by GetAudioData (the game's MovieAudioThread pushes them to sceAudioOut), but sceAudioOut is
+still silent: audio output is the next big item.
+
 Working rule: if a subsystem blocks progress, close it with a logging stub (the mechanism exists)
 and move on. `gr_port_report.txt` lists the functions that are still stubs, per library.
 

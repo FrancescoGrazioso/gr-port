@@ -18,8 +18,19 @@ passes).
 | `--no-gpu` | PM4 synchronization only, no Vulkan rendering |
 | `--frames N`, `--report f`, `--names f` | quit after N frames / linker report / name database |
 
-Reaching gameplay without a pad: `18:UP,19.5:CROSS`, then `CROSS` every 3 seconds from 30 to 420
-(apple taps and dialogues). Gameplay starts around flip 3800.
+Reaching gameplay without a pad: `26:UP,27.5:CROSS` (the title menu appears after the ~20 s intro movie), then `CROSS` every 3 seconds from 30 to 420
+(apple taps, dialogues; CROSS also skips the movie). Gameplay starts around flip 4500.
+
+**Faster:** `--skip-opening` removes the prologue and `--warp MISSION` starts New Game at any main
+mission; `tools\run_scenario.ps1` runs named scenarios built on them and compares the frames with
+reference captures. Both are described, with the rules they follow (original files untouched,
+opt-in, no game code in the repository), in [MODDING_AND_TESTING.md](MODDING_AND_TESTING.md).
+
+| Testing option | Effect |
+|---|---|
+| `--skip-opening`, `--warp MISSION`, `--mods DIR` | in-memory archive overlay (see MODDING_AND_TESTING.md) |
+| `--savedata DIR` | save directory (default `build\bin\savedata`) |
+| `--dump-at F1,F2,...`, `--dump-dir DIR`, `--exit-after-dumps` | capture the listed flips to DIR, quit after the last one |
 
 ## Renderer environment variables
 

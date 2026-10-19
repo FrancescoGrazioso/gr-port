@@ -42,6 +42,8 @@ struct RendererConfig {
     std::string dump_dir;   // PNG dumps of flipped frames (empty = off)
     uint32_t dump_every = 0; // dump every Nth flip (0 = off)
     uint32_t dump_first = 0; // skip flips before this one
+    std::vector<uint32_t> dump_at; // also dump these flips (sorted)
+    bool exit_after_dumps = false; // quit the process once the last dump_at flip is written
 };
 void RendererConfigure(const RendererConfig& c);
 bool RendererEnabled();

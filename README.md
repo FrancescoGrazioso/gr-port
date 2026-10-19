@@ -12,7 +12,7 @@
 
 > **Status: early but playable in parts.** The game boots, shows the title menu, plays the opening
 > with the falling apple, the comic dialogues, and reaches gameplay in Hekseville with Kat, the cat
-> and the pigeons on screen. Audio and pre-rendered movies are not implemented yet.
+> and the pigeons on screen. Pre-rendered movies play (Media Foundation); audio is not implemented yet.
 
 ---
 
@@ -119,7 +119,7 @@ external/       third-party headers (RenderDoc in-app API, MIT)
 ## Roadmap
 
 1. **Make the game fully playable**: remaining rendering issues (some materials, 2D macro-tiled
-   textures, performance), audio (NGS2 / SXD banks → WASAPI), movies (AvPlayer → Media Foundation).
+   textures, performance), audio (NGS2 / SXD banks → WASAPI, movie sound).
 2. **Mod support**: a `mods/` folder that overrides archive files, editable Lua scripts (most of the
    mission and event logic is plain Lua), code patches, texture and shader replacement, higher
    resolutions and frame rates.
@@ -127,7 +127,10 @@ external/       third-party headers (RenderDoc in-app API, MIT)
    grow the rewritten part subsystem by subsystem, to see how close to a real port we can get.
 
 The full plan, with every finding along the way, is in [docs/PLAN.md](docs/PLAN.md).
-Development options and tools are described in [docs/DEBUGGING.md](docs/DEBUGGING.md).
+Development options and tools are described in [docs/DEBUGGING.md](docs/DEBUGGING.md); testing
+shortcuts (skip the prologue, start at any mission, scripted scenarios with frame comparison) and the
+rules they follow are in [docs/MODDING_AND_TESTING.md](docs/MODDING_AND_TESTING.md). By default gr-port
+always runs the game exactly as shipped.
 
 ## Acknowledgements
 

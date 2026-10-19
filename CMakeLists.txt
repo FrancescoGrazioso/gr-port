@@ -98,6 +98,8 @@ if(WIN32)
     loader/kernel/avplayer.cpp
     loader/kernel/font.cpp
     loader/kernel/savedata.cpp
+    loader/kernel/overlay.cpp
+    loader/kernel/audio_out.cpp
     loader/gpu/gpu.cpp
     loader/gpu/gnm_driver.cpp
     loader/gpu/videoout.cpp
@@ -108,7 +110,7 @@ if(WIN32)
     loader/gpu/renderdoc.cpp
   )
   target_include_directories(gr_port PRIVATE loader ${stb_SOURCE_DIR} external/renderdoc)
-  target_link_libraries(gr_port PRIVATE gr_common Vulkan::Headers winmm xinput dbghelp
+  target_link_libraries(gr_port PRIVATE gr_common Vulkan::Headers winmm xinput dbghelp mfplat mfreadwrite mfuuid shlwapi ole32
                         glslang glslang-default-resource-limits)
   if(TARGET SPIRV)
     target_link_libraries(gr_port PRIVATE SPIRV)
