@@ -82,6 +82,13 @@ bool Is64BitSalu(const Instr& in) {
 
 const char* kHelpers = R"(
 float F(uint x) { return uintBitsToFloat(x); }
+// Depth compare of image_sample_c: f = sampler DEPTH_COMPARE_FUNC (never, less, equal, lequal, greater,
+// notequal, gequal, always); r = reference, t = texel.
+float DCmp(uint f, float r, float t) {
+    bool p = f == 1u ? r < t : f == 2u ? r == t : f == 3u ? r <= t : f == 4u ? r > t : f == 5u ? r != t
+           : f == 6u ? r >= t : f == 7u;
+    return p ? 1.0 : 0.0;
+}
 uint U(float x) { return floatBitsToUint(x); }
 #define EXEC ((s[126] & 1u) != 0u)
 uint CvtI32(float f) { if (isnan(f)) return 0u; return uint(int(clamp(f, -2147483648.0, 2147483520.0))); }
@@ -934,7 +941,19 @@ void Generator::EmitMimg(size_t idx, const Instr& in) {
             else if (bias) call = Fmt("texture(%s, uv, bias)", sampler.c_str());
             else call = Fmt("texture(%s, uv)", sampler.c_str());
             res = call;
-            if (cmp) res = Fmt("vec4((zref <= float(%s.x)) ? 1.0 : 0.0)", call.c_str());
+            if (cmp) {
+                // compare each texel, then filter (2x2 PCF through a gather) like the hardware does
+                s += Fmt("uint cf = (s[%u] >> 12u) & 7u; zref = clamp(zref, 0.0, 1.0); ", in.ssamp);
+                if ((dim == 0 || dim == 3) && !grad && !lod) {
+                    s += Fmt("vec2 gsz = vec2(textureSize(%s, 0).xy); vec2 gf = fract(uv.xy * gsz - 0.5); "
+                             "vec4 gt = textureGather(%s, uv, 0); "
+                             "vec4 gc = vec4(DCmp(cf, zref, gt.x), DCmp(cf, zref, gt.y), DCmp(cf, zref, gt.z), DCmp(cf, zref, gt.w)); ",
+                             tex.c_str(), sampler.c_str());
+                    res = "vec4(mix(mix(gc.w, gc.z, gf.x), mix(gc.x, gc.y, gf.x), gf.y))";
+                } else {
+                    res = Fmt("vec4(DCmp(cf, zref, float(%s.x)))", call.c_str());
+                }
+            }
         }
         if (kind != 0 && !cmp && !gather && op != 0x60) {
             // integer textures: keep raw values

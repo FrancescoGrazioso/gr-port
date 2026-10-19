@@ -334,6 +334,16 @@ unsupported types, thunk self-test passed, Vulkan window at 60 Hz.
    and the diffuse body is grey-blue with high alpha, to which the PS adds the stars. The black
    body seen on PS4 must come from the material constants (s[12:15] colour at cbuffer dword 0x14,
    star strength at 0x11) or the lighting terms; read those constants for this draw next.
+   **Shadow compares (2026-10-19):** `image_sample_c` used to compare `zref <= filtered depth`
+   whatever the sampler said. It now reads DEPTH_COMPARE_FUNC from sampler word 0 (bits 12-14),
+   clamps zref to [0,1] and, for 2D / 2D-array lookups, compares the four texels of a
+   `textureGather` and blends them bilinearly (2x2 PCF, as the hardware filters compare results).
+   Characters now get proper self-shadowing (Kat's hair and cape). Not verified against a PS4
+   frame yet: if scenes look too dark, check the compare function the game uses.
+   The cat is unchanged by mips and shadows. RT dumps show the pattern is already in the main colour
+   target right after the cat's own draw (not a post-process): a black body crossed by a light
+   grey web. Next suspects: the PS's light loop (tbuffer light list at s[8:11]), the cbuffer
+   material constants, or the GS output normals (param1/param2) the PS uses for lighting.
    The missing movie between the apple and gameplay is `mp4/ep00-01c.mp4` (AvPlayer is a stub).
    **Kat investigation, 2026-10-17 (afternoon), state when stopped:**
    - Auto-exposure fixed: the game reads the 1x1 average-luminance render target on the CPU
