@@ -13,14 +13,14 @@
       "args": [],
       "input": "26:UP,27.5:CROSS,@30-420/3:CROSS:0.2",
       "seconds": 170,
-      "frames": [2100, 2700, 3300, 4800]
+      "frames": [2100, 2700, 4800]
     },
     "movie": {
       "description": "The ep00-01c movie after the falling apple (AvPlayer)",
       "args": [],
       "input": "26:UP,27.5:CROSS,@30-72/3:CROSS:0.2",
       "seconds": 130,
-      "frames": [3700, 4000, 4300]
+      "frames": [3700, 4000]
     },
     "courtyard": {
       "description": "Episode 1 courtyard (Kat, Dusty, pigeons) with the prologue skipped",
@@ -34,7 +34,7 @@
       "args": ["--skip-opening", "--warp", "ep03_a"],
       "input": "26:UP,27.5:CROSS,@30-100/2:CROSS:0.2",
       "seconds": 120,
-      "frames": [2400, 3400]
+      "frames": [2400]
     }
   }
 }

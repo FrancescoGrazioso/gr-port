@@ -18,7 +18,7 @@
   "@from-to/step:BUTTON[:duration]" into a press every <step> seconds.
 
 .EXAMPLE
-  powershell -ExecutionPolicy Bypass -File tools\run_scenario.ps1 ep03
+  powershell -ExecutionPolicy Bypass -File tools\run_scenario.ps1 courtyard,ep03
   powershell -ExecutionPolicy Bypass -File tools\run_scenario.ps1 all -SaveReference
 #>
 param(
@@ -26,7 +26,8 @@ param(
     [switch]$SaveReference,
     [double]$Threshold = 12,
     [string]$Game = $env:GR_UROOT,
-    [switch]$Window
+    [switch]$Window,
+    [string]$Extra = ""   # extra loader arguments, e.g. "--trace 3000000"
 )
 
 $ErrorActionPreference = "Stop"
@@ -39,6 +40,8 @@ if (-not (Test-Path $Game)) { throw "game directory not found: $Game (pass -Game
 Add-Type -AssemblyName System.Drawing
 
 $all = (Get-Content (Join-Path $PSScriptRoot "scenarios.json") -Raw | ConvertFrom-Json).scenarios
+# names may also come as one comma-separated argument ("opening,movie" through powershell -File)
+$Name = @($Name | ForEach-Object { $_ -split "," } | Where-Object { $_ })
 $names = if ($Name -contains "all") { $all.PSObject.Properties.Name } else { $Name }
 
 function Expand-Input([string]$s) {
@@ -121,6 +124,7 @@ foreach ($n in $names) {
     else { New-Item -ItemType Directory -Force $saves | Out-Null }
     $argv += @("--savedata", "`"$saves`"")
     $argv += @($sc.args)
+    if ($Extra) { $argv += @($Extra -split " " | Where-Object { $_ }) }
     $inp = Expand-Input $sc.input
     if ($inp) { $argv += @("--input", "`"$inp`"") }
     Write-Host "== $n : $($sc.description)"

@@ -1233,9 +1233,13 @@ std::string Generator::Run() {
         // v0 = dword offset of strip vertex e in the GSVS ring (component 0), as the swizzled GS stores put it.
         const uint32_t is = key_.gs_params[3] & 0xFF, es = (key_.gs_params[3] >> 8) & 0xFF;
         g += "    uint gk = uint(gl_VertexIndex), gp = uint(gl_InstanceIndex);\n";
+        // Odd triangles of a strip swap their first two corners; the parity counts from the start of the
+        // strip the triangle belongs to (bit k of gcut = vertex k starts a new strip after a cut).
         g += "    uint gj = gk / 3u, gc = gk % 3u, ge = gj + gc;\n";
-        g += "    if ((gj & 1u) != 0u && gc < 2u) ge = gj + 1u - gc;\n";
         g += "    uint ginfo = ax[1u + gp], gcnt = ginfo & 0xFFu, gcut = ginfo >> 8u;\n";
+        g += "    uint gcm = gcut & (gj < 31u ? ((2u << gj) - 1u) : 0xFFFFFFFFu);\n";
+        g += "    uint gstart = gcm == 0u ? 0u : uint(findMSB(gcm));\n";
+        g += "    if (((gj - gstart) & 1u) != 0u && gc < 2u) ge = gj + 1u - gc;\n";
         g += "    bool gs_kill = !(gj + 2u < gcnt && ((gcut >> (gj + 1u)) & 3u) == 0u);\n";
         g += "    uint gtid = gp % 64u;\n";
         g += Fmt("    v[0] = ((gp / 64u) * %uu + (gtid / %uu) * %uu + ge * %uu + (gtid %% %uu) * %uu) / 4u;\n",

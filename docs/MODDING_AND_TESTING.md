@@ -70,7 +70,7 @@ patched scripts print `gr-port: opening skipped` and `gr-port warp: ep03_a` in t
 
 ```bat
 powershell -ExecutionPolicy Bypass -File tools\run_scenario.ps1 all -SaveReference
-powershell -ExecutionPolicy Bypass -File tools\run_scenario.ps1 courtyard ep03
+powershell -ExecutionPolicy Bypass -File tools\run_scenario.ps1 courtyard,ep03
 ```
 
 Each scenario lists its loader options, a scripted pad input, a time limit and the guest frames to

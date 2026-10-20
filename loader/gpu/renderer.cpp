@@ -2151,7 +2151,9 @@ void Renderer::Draw(const DrawInfo& d, const Regs& r) {
     if (su & 1) cull |= VK_CULL_MODE_FRONT_BIT;
     if (su & 2) cull |= VK_CULL_MODE_BACK_BIT;
     vkCmdSetCullMode(c, cull);
-    vkCmdSetFrontFace(c, (su & 4) ? VK_FRONT_FACE_CLOCKWISE : VK_FRONT_FACE_COUNTER_CLOCKWISE);
+    static const bool dbg_gs_flip = std::getenv("GR_DEBUG_GS_FLIP") != nullptr;
+    const bool cw = ((su & 4) != 0) != (dbg_gs_flip && gs_.active);
+    vkCmdSetFrontFace(c, cw ? VK_FRONT_FACE_CLOCKWISE : VK_FRONT_FACE_COUNTER_CLOCKWISE);
     static const uint64_t dbg_nodepth_vs = [] { const char* e = std::getenv("GR_DEBUG_NODEPTH"); return e ? std::strtoull(e, nullptr, 16) : 0ull; }();
     const bool dbg_nodepth = dbg_nodepth_vs && vs_addr == dbg_nodepth_vs;
     vkCmdSetDepthTestEnable(c, dt && z_enable && !dbg_nodepth);
@@ -2485,6 +2487,11 @@ void RendererDraw(const DrawInfo& d, const uint32_t* ctx, const uint32_t* sh, co
                   (unsigned long long)PgmAddr(g, reg::SPI_SHADER_PGM_LO_PS), (unsigned long long)(uint64_t(g.C(kCbBase)) << 8),
                   g.C(kCbBase + 4), (unsigned long long)(uint64_t(g.C(0xA012)) << 8), g.C(0xA200), g.C(0xA202),
                   r.DrawnCount() != drawn ? "drawn" : r.last_skip ? r.last_skip : "?");
+        // raster state: PA_SU_SC_MODE_CNTL, polygon offset (fmt, clamp, front scale/offset, back scale/offset),
+        // PA_CL_CLIP_CNTL, CB_BLEND0_CONTROL, DB_STENCIL_CONTROL
+        TraceNote("  raster su %08x poly %08x %08x %08x %08x %08x %08x clip %08x blend0 %08x stencil %08x", g.C(0xA205),
+                  g.C(0xA2DE), g.C(0xA2DF), g.C(0xA2E0), g.C(0xA2E1), g.C(0xA2E2), g.C(0xA2E3), g.C(0xA204), g.C(0xA1E0),
+                  g.C(0xA10B));
         // streamout state: VGT_STRMOUT_CONFIG / BUFFER_CONFIG, buffer 0 size/stride/offset, VS rsrc2 (SO_EN)
         if (g.C(0xA2E5) || (g.S(0x2C4B) & (1u << 12)))
             TraceNote("  streamout cfg %08x bufcfg %08x buf0 size %08x stride %08x | buf1 %08x %08x | vs rsrc2 %08x",

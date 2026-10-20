@@ -317,12 +317,17 @@ unsupported types, thunk self-test passed, Vulkan window at 60 Hz.
    Remaining for the geometry pipeline: only triangle-list input is handled; GS instancing, streams
    other than 0 and output primitive types other than strips are not; tessellation (LS/HS) is not
    emulated.
-   Open: Dusty (the cat) still looks wrong (grey-blue blotches instead of a black body with stars
-   and a light outline). Draw: VS 0x24e617d00 / PS 0x24e622a00, ES 0x24e612d00, GS 0x24e617f00;
-   diffuse 256x256 BC3 (alpha-masked, grey-blue clouds in RGB) and a 256x256 BC1 starfield sampled
-   at param4 = a 2x2 UV transform of the mesh UV (ES, cbuffer dwords 0x1c-0x2d). The PS adds
-   star * diffuse.a * constant to diffuse * lighting; the body colour must come from the material
-   constants or a later pass.
+   **Dusty fixed (2026-10-20).** The cat's grey blotches were not a texture problem: black-texture
+   experiments (`GR_DEBUG_BLACK_TEX`) left them unchanged. Every character has a second "outline"
+   draw (VS 0x24e625b00 / PS 0x24e626400, PA_SU_SC_MODE_CNTL 0x241 = cull front faces) that renders
+   the back faces of an inflated copy of the mesh; the body draw culls back faces (0x242). The cat's
+   GS emits several strips per invocation, and the copy VS computed the odd-triangle swap from the
+   start of the whole emit sequence instead of from the start of each strip (after a cut). Half of
+   the body's triangles came out with reversed winding, got culled, and the outline shell showed
+   through in a z-fighting pattern. The parity now restarts at the last cut (`gstart = findMSB(cut
+   bits <= j)`): Dusty is black with his starfield and a light outline, and Kat's outline is cleaner.
+   `GR_DEBUG_GS_FLIP=1` (invert the front face of all geometry-pipeline draws) is the diagnostic that
+   showed it: Kat turned into her outline, so her winding was right and the cat's was mixed.
    **Mip levels (2026-10-19):** micro-tiled textures (1D thin, tilings 5/9/13) now upload their
    whole mip chain (T# last_level), laid out as in shadPS4 `ComputeImageSize`: level i is
    `pitch >> i` (power-of-two padded with pow2pad, in blocks for BC), padded to 8x8 elements and
