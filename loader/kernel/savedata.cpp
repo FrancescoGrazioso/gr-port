@@ -6,6 +6,8 @@
 // Dialogs complete immediately with an affirmative result; trophies are accepted and ignored.
 #include <windows.h>
 
+#include <algorithm>
+#include <atomic>
 #include <filesystem>
 #include <fstream>
 #include <mutex>
@@ -46,6 +48,36 @@ bool Matches(const std::string& pattern, const std::string& name) { // '%' = any
 }
 
 fs::path MemoryFile() { return Root() / "sdmemory.bin"; }
+
+// Newest write time of the files in a save directory (0 when it holds no files: an empty directory is
+// not a save, e.g. one created by a mount that never wrote anything).
+int64_t SaveTime(const fs::path& dir) {
+    int64_t newest = 0;
+    std::error_code ec;
+    for (const auto& e : fs::recursive_directory_iterator(dir, ec))
+        if (e.is_regular_file(ec))
+            newest = std::max<int64_t>(newest, int64_t(e.last_write_time(ec).time_since_epoch().count()));
+    return newest;
+}
+
+// Save directories matching a DirNameSearch pattern, newest first.
+std::vector<std::string> FindSaves(const std::string& pattern) {
+    std::vector<std::pair<int64_t, std::string>> found;
+    std::error_code ec;
+    for (const auto& e : fs::directory_iterator(Root(), ec)) {
+        const std::string name = e.path().filename().string();
+        if (!e.is_directory() || name == "unmounted" || name == "data" || name == "temp" || !Matches(pattern, name)) continue;
+        const int64_t t = SaveTime(e.path());
+        if (t) found.push_back({t, name});
+    }
+    std::sort(found.begin(), found.end(), [](const auto& x, const auto& y) { return x.first > y.first; });
+    std::vector<std::string> names;
+    for (auto& [t, n] : found) names.push_back(n);
+    return names;
+}
+
+std::string g_dialog_choice; // save directory the (automatic) save data list dialog "selects"
+std::atomic<int32_t> g_dialog_status{0}; // sceSaveDataDialog status: 1 initialized, 2 running, 3 finished
 
 // Ensures the save-data-memory file exists with at least `size` bytes.
 void EnsureMemory(uint64_t size) {
@@ -110,12 +142,8 @@ void RegisterSaveData(Hle& h) {
         if (!a[0] || !a[1]) return kErrParameter;
         std::lock_guard<std::mutex> lk(g_sd);
         const std::string pattern = DirName(Load<uint64_t>(a[0] + 16));
-        std::vector<std::string> hits;
-        std::error_code ec;
-        for (const auto& e : fs::directory_iterator(Root(), ec))
-            if (e.is_directory() && e.path().filename() != "unmounted" && e.path().filename() != "data" &&
-                e.path().filename() != "temp" && Matches(pattern, e.path().filename().string()))
-                hits.push_back(e.path().filename().string());
+        const std::vector<std::string> hits = FindSaves(pattern); // newest first, empty directories skipped
+        g_dialog_choice = hits.empty() ? std::string() : hits.front();
         const uint64_t res = a[1];
         const uint64_t names = Load<uint64_t>(res + 8);
         const uint32_t cap = Load<uint32_t>(res + 16);
@@ -201,16 +229,50 @@ void RegisterSaveData(Hle& h) {
         return 0;
     });
 
-    // ---- dialogs: finish immediately
-    ImmediateDialog(h, "sceSaveDataDialog");
+    // ---- dialogs: finish immediately, except the save data progress bar (see below)
+    // SceSaveDataDialogParam { SceCommonDialogBaseParam base (48 bytes); i32 size; i32 mode; i32 dispType; ... }
+    // modes: 1 list, 2 user message, 3 system message, 4 error code, 5 progress bar. When loading, the game
+    // first opens a list (answered at once, see GetResult), then a system message ("Loading...") and
+    // performs the load while that dialog is RUNNING (and ready to display); system messages and progress
+    // bars therefore stay RUNNING until the game closes them;
+    // it closes the dialog itself afterwards. Answering FINISHED at once made "Continue" fail.
+    for (const char* n : {"sceSaveDataDialogInitialize", "sceSaveDataDialogTerminate"})
+        h.Register(n, [](const uint64_t*) -> uint64_t {
+            g_dialog_status = 0;
+            return 0;
+        });
+    h.Register("sceSaveDataDialogOpen", [](const uint64_t* a) -> uint64_t {
+        const int32_t mode = a[0] ? Load<int32_t>(a[0] + 52) : 0;
+        g_dialog_status = (mode == 3 || mode == 5) ? 2 : kDialogStatusFinished;
+        TraceNote("savedata: dialog opened (mode %d)", mode);
+        return 0;
+    });
+    h.Register("sceSaveDataDialogClose", [](const uint64_t*) -> uint64_t {
+        g_dialog_status = kDialogStatusFinished;
+        return 0;
+    });
+    for (const char* n : {"sceSaveDataDialogUpdateStatus", "sceSaveDataDialogGetStatus"})
+        h.Register(n, [](const uint64_t*) -> uint64_t { const int32_t st = g_dialog_status.load(); return uint64_t(st ? st : 1); });
+    h.Register("sceSaveDataDialogProgressBarSetValue", [](const uint64_t*) -> uint64_t { return 0; });
+    h.Register("sceSaveDataDialogProgressBarInc", [](const uint64_t*) -> uint64_t { return 0; });
     ImmediateDialog(h, "sceMsgDialog");
     ImmediateDialog(h, "sceErrorDialog");
     h.Register("sceSaveDataDialogIsReadyToDisplay", [](const uint64_t*) -> uint64_t { return 1; });
-    // SceSaveDataDialogResult { i32 mode; i32 result; i32 buttonId; ... } : OK, button YES
+    // SceSaveDataDialogResult { i32 mode; i32 result; i32 buttonId; pad; SceSaveDataDirName* dirName;
+    //   SceSaveDataParam* param; void* userData; ... } : OK, button YES. A list dialog (Continue, load)
+    // "selects" the newest save found by the last sceSaveDataDirNameSearch.
     h.Register("sceSaveDataDialogGetResult", [](const uint64_t* a) -> uint64_t {
         if (a[0]) {
             Store<int32_t>(a[0] + 4, 0);
             Store<int32_t>(a[0] + 8, 1);
+            std::lock_guard<std::mutex> lk(g_sd);
+            const uint64_t dir = Load<uint64_t>(a[0] + 16);
+            if (dir && !g_dialog_choice.empty()) {
+                char buf[32] = {};
+                std::snprintf(buf, sizeof buf, "%s", g_dialog_choice.c_str());
+                std::memcpy(Ptr<void>(dir), buf, 32);
+                TraceNote("savedata: dialog selects '%s'", g_dialog_choice.c_str());
+            }
         }
         return 0;
     });

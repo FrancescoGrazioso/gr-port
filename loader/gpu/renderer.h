@@ -19,11 +19,16 @@ namespace gr::gpu {
 struct OutputFrame {
     VkImage image = VK_NULL_HANDLE; // TRANSFER_SRC_OPTIMAL
     uint32_t width = 0, height = 0;
+    uint64_t seq = 0;               // increments with every guest flip written to the image
 };
 
 // Presenter side: locks the output image (always pair with ReleaseOutputFrame). Returns false when no
 // frame has been produced yet.
 bool AcquireOutputFrame(OutputFrame* f);
+// Lock-free: number of guest flips written to the output image so far, and an auto-reset event signalled
+// at each one (the presenter waits on it instead of polling the locked image, which starved the renderer).
+uint64_t OutputFrameSeq();
+void* OutputFrameEvent();
 void ReleaseOutputFrame();
 
 // Host-memory copy of the latest flipped frame, for a presenter running on another GPU (the display

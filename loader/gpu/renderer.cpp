@@ -607,9 +607,11 @@ public:
         f->image = out_.image;
         f->width = out_w_;
         f->height = out_h_;
+        f->seq = out_seq_.load();
         return true;
     }
     void Release() { out_m_.unlock(); }
+    uint64_t OutSeq() const { return out_seq_.load(); }
 
     std::vector<uint32_t> index_tmp_;
     // Vulkan pipeline cache persisted in <exe>/cache/pipelines.bin (driver-compiled pipelines)
@@ -745,6 +747,7 @@ private:
     uint32_t out_w_ = 0, out_h_ = 0;
     VkFormat out_fmt_ = VK_FORMAT_UNDEFINED;
     bool out_ready_ = false;
+    std::atomic<uint64_t> out_seq_{0}; // guest flips written to out_ (read without out_m_ by the presenter)
     vk::Buffer readback_;
 
     Stats stats_;
@@ -2261,6 +2264,8 @@ void Renderer::Flip(int32_t index) {
         }
         Flush();
         out_ready_ = true;
+        ++out_seq_;
+        if (HANDLE ev = OutputFrameEvent()) SetEvent(ev);
         stats_.flips_out++;
         if (stats_.pipelines != saved_pipelines_ && stats_.flips_out % 600 == 0) SavePipelineCache();
         if (cpu) {
@@ -2417,6 +2422,11 @@ RendererConfig g_cfg;
 } // namespace
 
 bool AcquireOutputFrame(OutputFrame* f) { return R().Acquire(f); }
+uint64_t OutputFrameSeq() { return R().OutSeq(); }
+void* OutputFrameEvent() {
+    static HANDLE ev = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    return ev;
+}
 void ReleaseOutputFrame() { R().Release(); }
 
 void RendererEnableCpuFrames(bool on) { R().cpu_frames_ = on; }

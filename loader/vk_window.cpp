@@ -45,6 +45,8 @@ struct Presenter {
     vk::Device& dev = vk::Device::Get();
     // device used for presenting: the shared one, or our own on another GPU (cross mode)
     bool cross = false;
+    uint64_t last_seq = ~0ull; // last guest frame presented
+    float last_t = 0;
     VkPhysicalDevice gpu = VK_NULL_HANDLE;
     VkDevice device = VK_NULL_HANDLE;
     VkQueue queue = VK_NULL_HANDLE;
@@ -196,7 +198,19 @@ struct Presenter {
         ci.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
         ci.preTransform = caps.currentTransform;
         ci.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
+        // MAILBOX never blocks in vkQueuePresentKHR: with FIFO the present waited for vblank while holding
+        // the queue (shared with the renderer) and the output image, which stalled the guest's flips.
         ci.presentMode = VK_PRESENT_MODE_FIFO_KHR;
+        {
+            uint32_t npm = 0;
+            vkGetPhysicalDeviceSurfacePresentModesKHR(gpu, surface, &npm, nullptr);
+            std::vector<VkPresentModeKHR> pms(npm);
+            vkGetPhysicalDeviceSurfacePresentModesKHR(gpu, surface, &npm, pms.data());
+            for (VkPresentModeKHR m : pms)
+                if (m == VK_PRESENT_MODE_MAILBOX_KHR && !(std::getenv("GR_PRESENT") && std::string(std::getenv("GR_PRESENT")) == "fifo")) ci.presentMode = m;
+            if (ci.presentMode == VK_PRESENT_MODE_MAILBOX_KHR) ci.minImageCount = std::max(ci.minImageCount, 3u);
+            if (caps.maxImageCount) ci.minImageCount = std::min(ci.minImageCount, caps.maxImageCount);
+        }
         ci.clipped = VK_TRUE;
         ci.oldSwapchain = old;
         if (VkResult r = vkCreateSwapchainKHR(device, &ci, nullptr, &swapchain); r != VK_SUCCESS)
@@ -301,6 +315,16 @@ struct Presenter {
 
     bool Frame(float t, std::string* err) {
         if (!swapchain) return true;
+        if (!cross) {
+            // present only frames the guest has not shown yet (and the placeholder animation until the first)
+            // (lock-free: polling the locked output image starved the renderer's flips)
+            const uint64_t seq = gpu::OutputFrameSeq();
+            if (seq != 0 && seq == last_seq && t - last_t < 0.1f) {
+                WaitForSingleObject(gpu::OutputFrameEvent(), 20); // next guest flip, or window upkeep
+                return true;
+            }
+            last_t = t;
+        }
         vkWaitForFences(device, 1, &fence, VK_TRUE, UINT64_MAX);
         uint32_t idx = 0;
         VkResult r = vkAcquireNextImageKHR(device, swapchain, UINT64_MAX, acquired, VK_NULL_HANDLE, &idx);
@@ -334,6 +358,7 @@ struct Presenter {
         } else if (gpu::AcquireOutputFrame(&out)) {
             // the renderer keeps its output image in TRANSFER_SRC layout
             BlitFrame(cmd, out.image, out.width, out.height, images[idx]);
+            last_seq = out.seq;
             drew = true;
         }
         if (!drew) {
@@ -364,9 +389,13 @@ struct Presenter {
         {
             std::lock_guard<std::mutex> lk(QueueMutex());
             sr = vkQueueSubmit(queue, 1, &si, fence);
-            if (sr == VK_SUCCESS) r = vkQueuePresentKHR(queue, &pi);
         }
+        // the blit is queued: the renderer may write the next frame now (same queue, so it runs after)
         if (!cross) gpu::ReleaseOutputFrame();
+        if (sr == VK_SUCCESS) {
+            std::lock_guard<std::mutex> lk(QueueMutex());
+            r = vkQueuePresentKHR(queue, &pi);
+        }
         if (sr != VK_SUCCESS) return Fail(err, "vkQueueSubmit failed", sr);
         if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR) g_resized = true;
         else if (r != VK_SUCCESS) return Fail(err, "vkQueuePresentKHR failed", r);
