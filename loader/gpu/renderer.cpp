@@ -519,6 +519,7 @@ struct Stats {
              tex_uploads = 0, tex_rt_copies = 0, rts = 0, flips = 0, flips_out = 0, clears = 0, dumped = 0,
              dispatches = 0, dispatched = 0, writebacks = 0, tiny_readbacks = 0, gs_draws = 0;
     double draw_ms = 0, wait_ms = 0, flip_ms = 0; // host time spent recording draws / waiting for the GPU / in flips
+    uint64_t upload_bytes = 0, upload_hits = 0;   // buffer bytes copied from guest memory / uploads reused
     std::map<std::string, uint64_t> skip_reasons;
 };
 
@@ -723,6 +724,16 @@ private:
     bool recording_ = false;
     vk::Buffer ring_;
     uint64_t ring_off_ = 0;
+    struct UploadKey {
+        uint64_t base, size;
+        bool operator==(const UploadKey& o) const { return base == o.base && size == o.size; }
+    };
+    struct UploadKeyHash {
+        size_t operator()(const UploadKey& k) const { return size_t(k.base * 0x9E3779B97F4A7C15ull ^ k.size); }
+    };
+    std::unordered_map<UploadKey, uint64_t, UploadKeyHash> upload_cache_; // buffer → ring offset, this ring generation
+    struct UploadStat { uint64_t bytes = 0, count = 0, last_size = 0; int kind = 0; uint32_t w3 = 0; };
+    std::map<std::pair<uint64_t, uint32_t>, UploadStat> upload_stats_; // (shader, resource) → GR_UPLOAD_STATS
     vk::Buffer scratch_; // device-local, depth → colour copies
     VkDescriptorPool dpool_ = VK_NULL_HANDLE;
     uint32_t sets_used_ = 0;
@@ -831,6 +842,7 @@ void Renderer::Flush() {
     vkResetFences(dev_.device(), 1, &fence_);
     recording_ = false;
     ring_off_ = 0;
+    upload_cache_.clear();
     vkResetDescriptorPool(dev_.device(), dpool_, 0);
     sets_used_ = 0;
     for (auto& g : garbage_) dev_.DestroyImage(g);
@@ -1502,10 +1514,32 @@ bool Renderer::BindShaderResources(ShaderEntry* e, const std::vector<uint32_t>& 
             uint64_t size = stride ? records * stride : d[2];
             size = std::min<uint64_t>(size, 32ull << 20);
             const uint64_t alloc = size + 64;
-            const uint64_t off = Alloc(alloc);
-            if (off == UINT64_MAX) return false;
-            std::memset(RingPtr(off + size), 0, 64);
-            if (size) SafeCopy(RingPtr(off), base, size_t(size));
+            // read-only buffers are uploaded once per ring generation (several draws of a submission often
+            // share the same vertex / constant / bone buffers)
+            uint64_t off = UINT64_MAX;
+            const UploadKey ukey{base, size};
+            if (!r.written)
+                if (auto it = upload_cache_.find(ukey); it != upload_cache_.end()) {
+                    off = it->second;
+                    stats_.upload_hits++;
+                }
+            if (off == UINT64_MAX) {
+                off = Alloc(alloc);
+                if (off == UINT64_MAX) return false;
+                std::memset(RingPtr(off + size), 0, 64);
+                if (size) SafeCopy(RingPtr(off), base, size_t(size));
+                stats_.upload_bytes += size;
+                if (!r.written) upload_cache_[ukey] = off;
+                static const bool ustats = std::getenv("GR_UPLOAD_STATS") != nullptr;
+                if (ustats && size >= (256u << 10)) { // Debug (GR_UPLOAD_STATS=1): biggest uploads at exit
+                    auto& u = upload_stats_[{e->t->key.code, uint32_t(i)}];
+                    u.bytes += size;
+                    u.count++;
+                    u.kind = int(r.kind);
+                    u.last_size = size;
+                    u.w3 = d[3];
+                }
+            }
             if (qtrace_) {
                 float f[64] = {};
                 const size_t nf = size_t(std::min<uint64_t>(std::max<uint64_t>(size / 4, 8), 64));
@@ -2401,8 +2435,23 @@ std::string Renderer::StatsText() {
                   (unsigned long long)stats_.flips, (unsigned long long)stats_.flips_out,
                   (unsigned long long)stats_.dumped);
     std::string s = buf;
-    std::snprintf(buf, sizeof buf, "\n  host time: %.0f ms recording draws, %.0f ms waiting for the GPU, %.0f ms in flips",
-                  stats_.draw_ms, stats_.wait_ms, stats_.flip_ms);
+    std::snprintf(buf, sizeof buf, "\n  host time: %.0f ms recording draws, %.0f ms waiting for the GPU, %.0f ms in flips; "
+                                   "%.0f MB of buffers uploaded, %llu uploads reused",
+                  stats_.draw_ms, stats_.wait_ms, stats_.flip_ms, double(stats_.upload_bytes) / 1048576.0,
+                  (unsigned long long)stats_.upload_hits);
+    s += buf;
+    if (!upload_stats_.empty()) {
+        std::vector<std::pair<std::pair<uint64_t, uint32_t>, UploadStat>> v(upload_stats_.begin(), upload_stats_.end());
+        std::sort(v.begin(), v.end(), [](const auto& x, const auto& y) { return x.second.bytes > y.second.bytes; });
+        for (size_t k = 0; k < v.size() && k < 12; ++k) {
+            std::snprintf(buf, sizeof buf, "\n    upload: shader 0x%llx res %u kind %d w3 %08x: %.0f MB in %llu uploads (last %llu bytes)",
+                          (unsigned long long)v[k].first.first, v[k].first.second, v[k].second.kind, v[k].second.w3,
+                          double(v[k].second.bytes) / 1048576.0, (unsigned long long)v[k].second.count,
+                          (unsigned long long)v[k].second.last_size);
+            s += buf;
+        }
+    }
+    buf[0] = 0;
     s += buf;
     std::snprintf(buf, sizeof buf, "\n  compute: %llu dispatches (%llu executed, %llu buffer write-backs), %llu tiny render-target read-backs, %llu geometry-pipeline draws",
                   (unsigned long long)stats_.dispatches, (unsigned long long)stats_.dispatched,

@@ -449,6 +449,20 @@ code: see [MODDING_AND_TESTING.md](MODDING_AND_TESTING.md). Real saves (the game
 start of each episode except `ep01_a`) are the next checkpoint mechanism; emulator-level save states
 are not planned.
 
+**Performance notes (2026-10-20).** Courtyard gameplay runs at ~28 fps windowed. A 110 s no-window
+run (courtyard, ~330 draws per frame) spends 43 s recording draws on the GPU thread and 31 s waiting
+for the GPU: `Flush()` submits and waits for the fence synchronously, so CPU recording and GPU
+execution never overlap. Draw sections: shader scalar pre-execution 18.5 s, resource binding 16 s
+(buffer uploads: ~125 GB copied from guest memory, mostly the 400-540 KB vertex/bone buffers of the
+characters, re-uploaded by every draw and pass), shader lookup 5 s. Read-only buffers are now
+uploaded once per ring generation (2 M reuses), but most traffic comes from distinct passes. Next
+steps, in order of payoff: (1) cache uploads across submissions by content hash (or keep the
+character buffers resident), (2) cache scalar pre-execution results per (shader, user data),
+(3) double-buffer command buffers / ring / descriptor pools so the GPU runs while the next
+submission is recorded (needs care for write-backs and EOP labels). `GR_UPLOAD_STATS=1` lists the
+heaviest uploads at exit; measure fps on the same scene (window title flips over 20 s), because a
+measurement taken on the title or in a dialogue is meaningless.
+
 **Movies (2026-10-19).** `loader/kernel/avplayer.cpp` now decodes for real. The game passes a path
 inside its archives (`mp4/ep00-01c.mp4`) plus file callbacks (SceAvPlayerFileReplacement at init
 data +40: open, close, readOffset, size); the player thread reads the whole file through them,
