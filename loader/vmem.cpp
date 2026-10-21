@@ -1,4 +1,5 @@
 #include "vmem.h"
+#include "write_watch.h"
 
 #include <windows.h>
 
@@ -12,7 +13,12 @@ uint64_t AlignUp(uint64_t v, uint64_t a) { return (v + a - 1) & ~(a - 1); }
 std::mutex g_vmem;
 
 uint64_t TryAt(uint64_t addr, uint64_t size, uint32_t type, uint32_t prot) {
-    return reinterpret_cast<uint64_t>(VirtualAlloc(reinterpret_cast<void*>(addr), size, type, prot));
+    // new reservations are write-watched (see write_watch.h): the renderer re-reads only written pages
+    const bool watch = (type & MEM_RESERVE) && WriteWatchEnabled();
+    const uint64_t p = reinterpret_cast<uint64_t>(
+        VirtualAlloc(reinterpret_cast<void*>(addr), size, type | (watch ? MEM_WRITE_WATCH : 0), prot));
+    if (p && watch) WriteWatchAdd(p, size);
+    return p;
 }
 
 uint64_t Search(uint64_t from, uint64_t to, uint64_t size, uint64_t align, uint32_t type, uint32_t prot) {

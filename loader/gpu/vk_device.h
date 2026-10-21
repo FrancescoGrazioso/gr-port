@@ -44,7 +44,7 @@
     X(vkCmdFillBuffer) X(vkCmdSetDepthBoundsTestEnable) X(vkCmdSetDepthBiasEnable) X(vkCmdSetRasterizerDiscardEnable) \
     X(vkCmdSetPrimitiveRestartEnable) X(vkCreateComputePipelines) X(vkCmdDispatch) X(vkCreatePipelineCache)    \
     X(vkGetPipelineCacheData) X(vkCreateQueryPool) X(vkCmdResetQueryPool) X(vkCmdBeginQuery) X(vkCmdEndQuery)  \
-    X(vkGetQueryPoolResults)
+    X(vkGetQueryPoolResults) X(vkCmdWriteTimestamp)
 
 #define GR_VK_DECLARE(fn) extern PFN_##fn fn;
 GR_VK_GLOBAL_FUNCS(GR_VK_DECLARE)
@@ -83,6 +83,7 @@ public:
     VkDevice device() const { return device_; }
     uint32_t queue_family() const { return queue_family_; }
     const std::string& gpu_name() const { return gpu_name_; }
+    float timestamp_period() const { return timestamp_period_; } // ns per timestamp tick
     bool wave64() const { return wave64_; } // compute pipelines can require 64-wide subgroups
 
     // The single queue is shared by renderer and presenter: hold this lock around submit/present.
@@ -114,6 +115,7 @@ private:
     uint32_t queue_family_ = 0;
     VkPhysicalDeviceMemoryProperties mem_props_{};
     std::string gpu_name_, error_;
+    float timestamp_period_ = 1.0f;
     bool subgroup_size_control_ = false, wave64_ = false;
     std::mutex queue_m_;
 };

@@ -463,7 +463,7 @@ lines in the trace, always on the same scene (courtyard, ~700 draws per flip). I
    map of every instruction address and per-instruction resource lists (heap traffic was ~30% of
    the GPU thread). `Translate` now builds `pre_ops`, the list of scalar instructions, branches
    (with resolved targets) and resource captures; pre-exec time fell from 21 s to 3.5 s per run.
-3. **CPU and GPU overlap.** Two submission slots (command buffer, fence, descriptor pool, half of
+3. **CPU and GPU overlap.** Submission slots (two at first, four now, see below; each a command buffer, fence, descriptor pool, half of
    the upload ring, retired images, deferred read-backs): `Submit()` queues a slot and reuses the
    other once its fence has signalled, so the GPU runs a submission while the next is recorded.
    `Flush()` (Submit + wait) remains for paths that read results on the CPU: compute write-backs,
@@ -476,11 +476,36 @@ lines in the trace, always on the same scene (courtyard, ~700 draws per flip). I
    texture content hash runs four independent lanes, and per-draw vectors are reused.
 
 The GPU thread is now busy ~50% of the time at 60 fps in the courtyard (recording 2.6 s per 5 s).
-Next candidates, from the profile: texture lookups (`GetTexture`, ~13%, including the per-submission
-content hashes), buffer uploads from guest memory (~12%, ~2 GB/s: a cross-submission cache needs
-page write-tracking to be cheaper than the copy, because hashing a buffer costs about as much as
-copying it), `UploadKey` map lookups and `HashKey` (~4% each). The 1500-draw opening scene still
-waits on the GPU (~1.3 s per 5 s): look at its compute write-backs, which flush synchronously.
+
+**Hekseville alleys (ep03_a, ~7000 draws per flip): 14 → ~50 fps** (2026-10-21, same day). The
+game really issues ~7000 draws per frame there (`GR_DRAW_STATS=1`: mostly tiny pieces of big
+meshes, 6-100 indices each), so the per-draw host cost decides. In order of payoff:
+1. **Vertex buffers from the lowest index.** Index-fetched buffers were copied from element 0 up to
+   the highest index, i.e. the whole prefix of a big shared vertex buffer for every small piece
+   (~130 GB in 80 s). Now only [lowest, highest] is copied and the binding starts `skip` bytes
+   earlier (256-aligned), so the shader's element indices are unchanged (14 → 21 fps).
+2. **Four submission slots.** A frame is a heavy submission plus a small flip submission, and the
+   GPU runs about a frame behind: with two slots the small one waited for the heavy one at once
+   (21 → 25 with three slots, → 36 with four, GPU waits ~0). GPU work is ~13 ms per flip here
+   (per-slot timestamps, in the fps trace line).
+3. **Faster keys**: `HashKey` hashes 8 bytes at a time on four lanes and is stored in ShaderEntry
+   (the pipeline key reuses it); the per-submission upload cache is an open-addressing table emptied
+   by a generation bump instead of an `unordered_map` (25 → 31 fps).
+4. **Guest write tracking** (`loader/write_watch.*`). Guest reservations get `MEM_WRITE_WATCH`;
+   once per flip the renderer collects the written pages (`GetWriteWatch`, reset) into a per-page
+   generation table. Only allocations the renderer has read from are collected (~3 GB of 4.5 GB,
+   ~0.8 ms per flip). Kernel-mode writes (ReadFile) are seen too; released or decommitted ranges are
+   stamped as changed. Uses so far:
+   - textures skip their per-submission content hash while their pages are unwritten;
+   - **resident buffers**: a read-only buffer (>= 4 KB) whose pages were not written since it was
+     last seen is copied once into a 1 GB arena (host-visible VRAM) and bound from there in later
+     frames; buffers written every frame (bones, constants) stay in the ring. Arena entries are
+     never overwritten, so in-flight frames stay valid; when the arena is 90% full it is emptied
+     at a flip after waiting for the GPU (36 → 49 fps, uploads 82 → 15 GB per 75 s).
+Remaining per-draw costs (profile): `GetTexture` (~20% with the RT-copy and lookup work), scalar
+pre-execution (~12%), copies of the remaining small buffers, descriptor writes. Latency: four
+slots let the GPU run up to two frames behind the game; if input lag shows, the flip submission
+could be merged into the frame's heavy one instead.
 
 **Performance notes (2026-10-20, superseded).** Courtyard gameplay runs at ~28 fps windowed. A 110 s no-window
 

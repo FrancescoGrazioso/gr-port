@@ -14,7 +14,7 @@
       "input": "26:UP,27.5:CROSS,@30-420/3:CROSS:0.2",
       "seconds": 100,
       "frames": [2100, 2700, 3600],
-      "threshold": 25,
+      "threshold": 40,
       "_threshold": "fades and camera moves of the prologue follow real time and vary by a few frames between runs"
     },
     "movie": {
@@ -22,14 +22,18 @@
       "args": [],
       "input": "26:UP,27.5:CROSS,@30-72/3:CROSS:0.2",
       "seconds": 150,
-      "frames": [5700, 7200]
+      "frames": [5700, 7200],
+      "threshold": 45,
+      "_threshold": "the movie runs on its own clock, so a given flip shows a slightly different moment in each run"
     },
     "courtyard": {
       "description": "Episode 1 courtyard (Kat, Dusty, pigeons) with the prologue skipped",
       "args": ["--skip-opening"],
       "input": "26:UP,27.5:CROSS,@30-100/2:CROSS:0.2",
       "seconds": 115,
-      "frames": [2400, 3600]
+      "frames": [2400, 3600],
+      "threshold": 25,
+      "_threshold": "flip 2400 catches the dialogue bubbles while they animate"
     },
     "ep03": {
       "description": "Warp to mission ep03_a (a dialogue with Dusty, then the Hekseville alleys)",

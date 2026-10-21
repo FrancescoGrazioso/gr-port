@@ -9,6 +9,7 @@
 #include "guest.h"
 #include "kernel.h"
 #include "vmem.h"
+#include "write_watch.h"
 
 namespace gr::kernel {
 namespace {
@@ -55,9 +56,13 @@ void Unmap(uint64_t addr, uint64_t len) {
     MEMORY_BASIC_INFORMATION mbi{};
     if (!VirtualQuery(reinterpret_cast<void*>(addr), &mbi, sizeof mbi)) return;
     if (reinterpret_cast<uint64_t>(mbi.AllocationBase) == addr && mbi.RegionSize >= len)
+    {
         VirtualFree(reinterpret_cast<void*>(addr), 0, MEM_RELEASE);
-    else
+        WriteWatchRemove(addr);
+    } else {
         VirtualFree(reinterpret_cast<void*>(addr), len, MEM_DECOMMIT);
+        WriteWatchTouch(addr, len);
+    }
 }
 
 int MapDirect(uint64_t addr_pp, uint64_t len, uint64_t prot, uint64_t flags, uint64_t phys, uint64_t align,

@@ -116,6 +116,8 @@ std::unique_ptr<TranslatedShader> Translate(const ShaderKey& key, const uint32_t
 struct ResourceDescriptors {
     std::vector<std::array<uint32_t, 8>> values; // one per TranslatedShader::resources entry
 };
+// SMRD reads of the pre-executor that faulted (statistics)
+extern uint64_t g_read_faults;
 void ScalarPreExecute(const TranslatedShader& s, const uint32_t* user_sgprs, std::vector<uint32_t>& sdata,
                       ResourceDescriptors& out);
 

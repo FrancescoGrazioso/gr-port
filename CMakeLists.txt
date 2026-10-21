@@ -91,6 +91,7 @@ if(WIN32)
     loader/linker.cpp
     loader/vk_window.cpp
     loader/profiler.cpp
+    loader/write_watch.cpp
     loader/tls.cpp
     loader/vmem.cpp
     loader/guest.cpp

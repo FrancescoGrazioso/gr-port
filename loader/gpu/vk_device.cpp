@@ -66,6 +66,7 @@ bool Device::Init() {
                 gpu_ = g;
                 queue_family_ = i;
                 gpu_name_ = p.deviceName;
+                timestamp_period_ = p.limits.timestampPeriod;
             }
             break;
         }

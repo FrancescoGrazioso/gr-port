@@ -17,15 +17,33 @@
 #include <SPIRV/GlslangToSpv.h>
 
 namespace gr::gpu {
+
+uint64_t g_read_faults = 0;
 using namespace gcn;
 
 bool ShaderKey::operator==(const ShaderKey& o) const { return std::memcmp(this, &o, sizeof(ShaderKey)) == 0; }
 
 uint64_t HashKey(const ShaderKey& k) {
+    // 8 bytes at a time on four lanes (called several times per draw); the tail byte-wise
     const auto* p = reinterpret_cast<const uint8_t*>(&k);
-    uint64_t h = 1469598103934665603ull;
-    for (size_t i = 0; i < sizeof(ShaderKey); ++i) h = (h ^ p[i]) * 1099511628211ull;
-    return h;
+    constexpr size_t n = sizeof(ShaderKey), words = n / 8;
+    uint64_t h[4] = {1469598103934665603ull, 0x9E3779B97F4A7C15ull, 0xC2B2AE3D27D4EB4Full, 0x165667B19E3779F9ull};
+    size_t i = 0;
+    for (; i + 4 <= words; i += 4)
+        for (int l = 0; l < 4; ++l) {
+            uint64_t v;
+            std::memcpy(&v, p + (i + l) * 8, 8);
+            h[l] = (h[l] ^ v) * 0x100000001B3ull;
+            h[l] ^= h[l] >> 31;
+        }
+    for (; i < words; ++i) {
+        uint64_t v;
+        std::memcpy(&v, p + i * 8, 8);
+        h[0] = (h[0] ^ v) * 0x100000001B3ull;
+        h[0] ^= h[0] >> 31;
+    }
+    for (size_t b = words * 8; b < n; ++b) h[1] = (h[1] ^ p[b]) * 1099511628211ull;
+    return (h[0] ^ (h[1] * 0x9E3779B97F4A7C15ull)) + (h[2] ^ (h[3] * 31));
 }
 
 namespace {
@@ -1324,6 +1342,7 @@ bool SafeRead(uint64_t addr, void* dst, size_t n) {
         std::memcpy(dst, reinterpret_cast<const void*>(addr), n);
         return true;
     } __except (EXCEPTION_EXECUTE_HANDLER) {
+        ++g_read_faults;
         std::memset(dst, 0, n);
         return false;
     }

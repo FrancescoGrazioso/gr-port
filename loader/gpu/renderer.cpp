@@ -25,6 +25,7 @@
 #include "gpu/shader_recompiler.h"
 #include "gpu/videoout.h"
 #include "guest.h"
+#include "write_watch.h"
 
 namespace fs = std::filesystem;
 
@@ -121,12 +122,14 @@ bool Readable(uint64_t addr, size_t n) {
     return addr + n <= hi;
 }
 
+uint64_t g_copy_faults = 0; // SafeCopy reads that faulted (each one costs an exception)
 bool SafeCopy(void* dst, uint64_t src, size_t n) {
     if (src < 0x10000) { std::memset(dst, 0, n); return false; }
     __try {
         std::memcpy(dst, reinterpret_cast<const void*>(src), n);
         return true;
     } __except (EXCEPTION_EXECUTE_HANDLER) {
+        ++g_copy_faults;
         std::memset(dst, 0, n);
         return false;
     }
@@ -494,10 +497,12 @@ struct Texture {
     uint32_t layers = 1;
     uint32_t levels = 1;               // mip levels uploaded from guest memory
     uint64_t last_check_submit = ~0ull;
+    uint32_t watch_gen = 0;            // write-watch generation of the last content check
 };
 
 struct ShaderEntry {
     std::unique_ptr<TranslatedShader> t;
+    uint64_t key_hash = 0; // HashKey(t->key)
     VkShaderModule module = VK_NULL_HANDLE;
     VkDescriptorSetLayout layout = VK_NULL_HANDLE;
     bool ok = false;
@@ -522,8 +527,9 @@ struct Pipeline {
 struct Stats {
     uint64_t draws = 0, drawn = 0, skipped = 0, shaders = 0, shader_fail = 0, pipelines = 0, textures = 0,
              tex_uploads = 0, tex_rt_copies = 0, rts = 0, flips = 0, flips_out = 0, clears = 0, dumped = 0,
-             dispatches = 0, dispatched = 0, writebacks = 0, tiny_readbacks = 0, gs_draws = 0;
-    double draw_ms = 0, wait_ms = 0, flip_ms = 0; // host time spent recording draws / waiting for the GPU / in flips
+             dispatches = 0, dispatched = 0, writebacks = 0, tiny_readbacks = 0, gs_draws = 0, passes = 0, sync_flushes = 0,
+             arena_hits = 0, arena_bytes = 0, arena_resets = 0;
+    double draw_ms = 0, wait_ms = 0, flip_ms = 0, gpu_ms = 0; // host time spent recording draws / waiting for the GPU / in flips
     uint64_t upload_bytes = 0, upload_hits = 0;   // buffer bytes copied from guest memory / uploads reused
     std::map<std::string, uint64_t> skip_reasons;
 };
@@ -539,6 +545,57 @@ public:
     bool qtrace_ = false;
     uint32_t qcount_ = 0;
     int32_t last_query_ = -1;
+    // Debug (GR_GPU_PROFILE=<submission>): a GPU timestamp after every draw of that submission; the
+    // time between consecutive timestamps is charged to the (VS, PS) pair of the draw (at exit of the
+    // submission, the 25 most expensive pairs go to the trace)
+    static constexpr uint32_t kMaxTimestamps = 32768;
+    VkQueryPool ts_pool_ = VK_NULL_HANDLE;
+    bool tsprof_ = false;
+    uint32_t ts_count_ = 0;
+    std::vector<std::pair<uint64_t, uint64_t>> ts_keys_; // (VS, PS) of timestamp i (i >= 1)
+    void GpuProfileBegin() {
+        static const int64_t at = [] { const char* e = std::getenv("GR_GPU_PROFILE"); return e ? std::atoll(e) : -1; }();
+        tsprof_ = int64_t(submit_index_) == at;
+        if (!tsprof_) return;
+        if (!ts_pool_) {
+            VkQueryPoolCreateInfo qi{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
+            qi.queryType = VK_QUERY_TYPE_TIMESTAMP;
+            qi.queryCount = kMaxTimestamps;
+            vkCreateQueryPool(dev_.device(), &qi, nullptr, &ts_pool_);
+        }
+        VkCommandBuffer c = Cmd();
+        vkCmdResetQueryPool(c, ts_pool_, 0, kMaxTimestamps);
+        vkCmdWriteTimestamp(c, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, ts_pool_, 0);
+        ts_count_ = 1;
+        ts_keys_.assign(1, {0, 0});
+    }
+    void GpuProfileDraw(VkCommandBuffer c, uint64_t vs, uint64_t ps) {
+        if (!tsprof_ || ts_count_ >= kMaxTimestamps) return;
+        vkCmdWriteTimestamp(c, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, ts_pool_, ts_count_++);
+        ts_keys_.push_back({vs, ps});
+    }
+    void GpuProfileEnd() {
+        if (!tsprof_) return;
+        tsprof_ = false;
+        Flush();
+        std::vector<uint64_t> t(ts_count_);
+        vkGetQueryPoolResults(dev_.device(), ts_pool_, 0, ts_count_, ts_count_ * 8, t.data(), 8,
+                              VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
+        const double ns = dev_.timestamp_period();
+        std::map<std::pair<uint64_t, uint64_t>, std::pair<double, uint32_t>> cost;
+        for (uint32_t i = 1; i < ts_count_; ++i) {
+            auto& c = cost[ts_keys_[i]];
+            c.first += double(t[i] - t[i - 1]) * ns / 1e6;
+            c.second++;
+        }
+        std::vector<std::pair<std::pair<uint64_t, uint64_t>, std::pair<double, uint32_t>>> v(cost.begin(), cost.end());
+        std::sort(v.begin(), v.end(), [](const auto& a, const auto& b) { return a.second.first > b.second.first; });
+        TraceNote("gpu profile of submission %llu: %u draws, %.2f ms from the first to the last", (unsigned long long)submit_index_,
+                  ts_count_ - 1, ts_count_ > 1 ? double(t[ts_count_ - 1] - t[0]) * ns / 1e6 : 0.0);
+        for (size_t k = 0; k < v.size() && k < 25; ++k)
+            TraceNote("  gpu: VS 0x%llx PS 0x%llx: %.3f ms in %u draws", (unsigned long long)v[k].first.first,
+                      (unsigned long long)v[k].first.second, v[k].second.first, v[k].second.second);
+    }
     void BeginSubmission(uint64_t index) {
         submit_index_ = index;
         static const int64_t trace_at = [] { const char* e = std::getenv("GR_DRAW_TRACE"); return e ? std::atoll(e) : -1; }();
@@ -557,6 +614,7 @@ public:
             if (qpool_) vkCmdResetQueryPool(Cmd(), qpool_, 0, kMaxQueries);
             qcount_ = 0;
         }
+        if (Init()) GpuProfileBegin();
     }
     void Draw(const DrawInfo& d, const Regs& r);
     void Dispatch(uint32_t gx, uint32_t gy, uint32_t gz, const Regs& r);
@@ -565,14 +623,14 @@ public:
     // ride with the submission and land in guest memory when its slot is retired (about one frame
     // later, which only delays the exposure adaptation by a frame).
     void ReadbackTinyTargets() {
-        const uint64_t base = (32ull << 20) + uint64_t(cur_) * (2ull << 20); // past the area used for CPU frame copies
+        const uint64_t base = (32ull << 20) + uint64_t(cur_) * (1ull << 20); // past the area used for CPU frame copies
         uint64_t off = base;
         Slot& s = slots_[cur_];
         for (auto& [addr, rt] : rts_) {
             const uint64_t px = uint64_t(rt.img.width) * rt.img.height;
             if (rt.depth || px > 64 || rt.gen == rt.readback_gen) continue;
             const uint64_t bytes = px * std::max<uint32_t>(FormatBytes(rt.img.format), 1);
-            if (off + bytes > base + (2ull << 20) || off + bytes > readback_.size) break;
+            if (off + bytes > base + (1ull << 20) || off + bytes > readback_.size) break;
             VkCommandBuffer c = Cmd();
             Barrier(c, rt.img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
             VkBufferImageCopy bc{};
@@ -589,6 +647,7 @@ public:
     void EndSubmission() {
         ReadbackTinyTargets();
         Submit(); // the GPU runs this submission while the next one is recorded
+        GpuProfileEnd();
         const bool rdoc = int64_t(submit_index_) == RenderDocTargetSubmission();
         if (rdoc || qtrace_) Flush();
         if (rdoc) RenderDocEndCapture();
@@ -702,7 +761,7 @@ private:
     Texture* GetTexture(const uint32_t* t, uint32_t& kind);
     VkDescriptorSetLayout EmptyLayout();
     bool BindShaderResources(ShaderEntry* e, const std::vector<uint32_t>& sdata, const ResourceDescriptors& desc,
-                             VkDescriptorSet& set, uint32_t max_records);
+                             VkDescriptorSet& set, uint32_t max_records, uint32_t min_records = 0);
 
     // Legacy geometry pipeline (ES → GS → copy VS). The ES and the GS run as compute passes that write the
     // ESGS / GSVS rings; those rings live in two GPU buffers (only shaders read them) sized for a whole draw:
@@ -723,10 +782,10 @@ private:
     vk::Device& dev_;
     bool init_ = false, init_ok_ = false;
     VkCommandPool pool_ = VK_NULL_HANDLE;
-    // Two submission slots, so the GPU runs one submission while the next is recorded. Each slot owns a
+    // Submission slots, so the GPU runs earlier submissions while the next is recorded. Each slot owns a
     // command buffer, a fence, a descriptor pool, half of the upload ring, the images retired while it
     // was recorded and its deferred tiny read-backs; a slot is reused once its fence has signalled.
-    static constexpr int kSlots = 2;
+    static constexpr int kSlots = 4; // a frame is a heavy submission plus a small one (the flip): two slots would wait for the heavy one right away
     static constexpr uint64_t kRingHalf = 256ull << 20;
     struct TinyReadback { uint64_t addr, off, bytes; };
     struct Slot {
@@ -737,6 +796,7 @@ private:
         std::vector<vk::Image> garbage;
         std::vector<VkImageView> garbage_views;
         std::vector<TinyReadback> tiny;
+        VkQueryPool ts = VK_NULL_HANDLE; // GPU timestamps at the start and the end of the command buffer
     } slots_[kSlots];
     int cur_ = 0;
     uint64_t ring_slot_base_ = 0;
@@ -761,20 +821,69 @@ private:
     vk::Buffer ring_;
     uint64_t ring_off_ = 0;
     struct UploadKey {
-        uint64_t base, size;
-        bool operator==(const UploadKey& o) const { return base == o.base && size == o.size; }
+        uint64_t base, size, skip;
+        bool operator==(const UploadKey& o) const { return base == o.base && size == o.size && skip == o.skip; }
     };
+    // buffer → binding offset, for the current ring generation: open addressing, emptied in O(1) by
+    // bumping the generation (it is emptied at every submission and looked up several times per draw)
+    struct UploadCache {
+        static constexpr uint32_t kCap = 1u << 16, kMaxProbe = 32;
+        struct Slot { UploadKey key; uint64_t off; uint32_t gen; };
+        std::vector<Slot> slots = std::vector<Slot>(kCap);
+        uint32_t gen = 1, used = 0;
+        static uint32_t Hash(const UploadKey& k) {
+            uint64_t h = (k.base * 0x9E3779B97F4A7C15ull) ^ (k.size * 0xC2B2AE3D27D4EB4Full) ^ (k.skip << 7);
+            return uint32_t((h ^ (h >> 29)) & (kCap - 1));
+        }
+        const uint64_t* Find(const UploadKey& k) const {
+            for (uint32_t i = Hash(k), n = 0; n < kMaxProbe; i = (i + 1) & (kCap - 1), ++n) {
+                const Slot& s = slots[i];
+                if (s.gen != gen) return nullptr;
+                if (s.key == k) return &s.off;
+            }
+            return nullptr;
+        }
+        void Insert(const UploadKey& k, uint64_t off) {
+            if (used >= kCap / 2) return; // full enough: later buffers are simply uploaded again
+            for (uint32_t i = Hash(k), n = 0; n < kMaxProbe; i = (i + 1) & (kCap - 1), ++n) {
+                Slot& s = slots[i];
+                if (s.gen != gen) { s = {k, off, gen}; ++used; return; }
+                if (s.key == k) { s.off = off; return; }
+            }
+        }
+        void Clear() { ++gen; used = 0; }
+    } upload_cache_;
+    // Resident buffer copies (see BindShaderResources): host-visible VRAM when available, written once
+    // per buffer and never overwritten while bound; emptied (after waiting for the GPU) when full.
+    static constexpr uint64_t kArenaFlag = 1ull << 63; // upload_cache_ value: offset is in arena_
+    static constexpr uint64_t kArenaMin = 4096;        // smaller buffers are cheaper to copy than to track
+    static constexpr uint64_t kArenaSize = 1ull << 30;
     struct UploadKeyHash {
-        size_t operator()(const UploadKey& k) const { return size_t(k.base * 0x9E3779B97F4A7C15ull ^ k.size); }
+        size_t operator()(const UploadKey& k) const {
+            return size_t((k.base * 0x9E3779B97F4A7C15ull) ^ (k.size * 0xC2B2AE3D27D4EB4Full) ^ (k.skip << 7));
+        }
     };
-    std::unordered_map<UploadKey, uint64_t, UploadKeyHash> upload_cache_; // buffer → ring offset, this ring generation
+    struct ArenaEntry { uint64_t off = UINT64_MAX; uint32_t gen = 0; bool seen = false; };
+    vk::Buffer arena_;
+    uint64_t arena_off_ = 0;
+    std::unordered_map<UploadKey, ArenaEntry, UploadKeyHash> arena_map_;
+    void ResetArenaIfFull() {
+        if (arena_off_ < kArenaSize / 10 * 9 && arena_map_.size() < 400000) return;
+        Flush(); // nothing in flight may still read the arena
+        arena_off_ = 0;
+        arena_map_.clear();
+        upload_cache_.Clear();
+        stats_.arena_resets++;
+    }
     struct UploadStat { uint64_t bytes = 0, count = 0, last_size = 0; int kind = 0; uint32_t w3 = 0; };
     std::map<std::pair<uint64_t, uint32_t>, UploadStat> upload_stats_; // (shader, resource) → GR_UPLOAD_STATS
+    std::map<std::tuple<uint64_t, uint64_t, uint32_t>, uint64_t> draw_stats_; // (VS, PS, count) → GR_DRAW_STATS
     vk::Buffer scratch_; // device-local, depth → colour copies
     VkDescriptorPool dpool_ = VK_NULL_HANDLE;
     uint32_t sets_used_ = 0;
     VkDescriptorSetLayout empty_layout_ = VK_NULL_HANDLE;
     uint64_t submit_index_ = 0;
+    uint32_t ww_gen_ = 0; // write-watch generation (one per flip)
 
     std::unordered_map<uint64_t, RenderTarget> rts_, depths_;
     std::unordered_map<uint64_t, uint64_t> stencil_to_depth_; // stencil plane address -> depth target address
@@ -834,6 +943,10 @@ bool Renderer::Init() {
         vkAllocateCommandBuffers(dev_.device(), &ai, &s.cmd);
         vkCreateFence(dev_.device(), &fci, nullptr, &s.fence);
         vkCreateDescriptorPool(dev_.device(), &dci, nullptr, &s.pool);
+        VkQueryPoolCreateInfo qi{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
+        qi.queryType = VK_QUERY_TYPE_TIMESTAMP;
+        qi.queryCount = 2;
+        vkCreateQueryPool(dev_.device(), &qi, nullptr, &s.ts);
     }
     // one half of the ring per slot
     ring_ = dev_.CreateBuffer(kSlots * kRingHalf,
@@ -842,6 +955,7 @@ bool Renderer::Init() {
                               true, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT); // ReBAR VRAM when available: the GPU reads it a lot
     scratch_ = dev_.CreateBuffer(64ull << 20, VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, false);
     readback_ = dev_.CreateBuffer(4096ull * 2304 * 4, VK_BUFFER_USAGE_TRANSFER_DST_BIT, true, VK_MEMORY_PROPERTY_HOST_CACHED_BIT);
+    arena_ = dev_.CreateBuffer(kArenaSize, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, true, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
     UseSlot(0);
     if (!ring_.mapped || !dpool_ || !cmd_) {
         TraceNote("renderer: failed to create Vulkan resources");
@@ -862,6 +976,8 @@ VkCommandBuffer Renderer::Cmd() {
         vkResetCommandBuffer(cmd_, 0);
         vkBeginCommandBuffer(cmd_, &bi);
         recording_ = true;
+        vkCmdResetQueryPool(cmd_, slots_[cur_].ts, 0, 2);
+        vkCmdWriteTimestamp(cmd_, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, slots_[cur_].ts, 0);
     }
     return cmd_;
 }
@@ -888,6 +1004,9 @@ void Renderer::Retire(Slot& s) {
         stats_.wait_ms += NowMs() - wait_t0;
         vkResetFences(dev_.device(), 1, &s.fence);
         s.pending = false;
+        uint64_t t[2] = {};
+        if (vkGetQueryPoolResults(dev_.device(), s.ts, 0, 2, sizeof t, t, 8, VK_QUERY_RESULT_64_BIT) == VK_SUCCESS && t[1] > t[0])
+            stats_.gpu_ms += double(t[1] - t[0]) * dev_.timestamp_period() / 1e6;
     }
     for (auto& g : s.garbage) dev_.DestroyImage(g);
     s.garbage.clear();
@@ -901,6 +1020,7 @@ void Renderer::Retire(Slot& s) {
 void Renderer::Submit() {
     if (!recording_) return;
     EndPass();
+    vkCmdWriteTimestamp(cmd_, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, slots_[cur_].ts, 1);
     vkEndCommandBuffer(cmd_);
     Slot& s = slots_[cur_];
     VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
@@ -917,7 +1037,7 @@ void Renderer::Submit() {
     s.garbage_views.insert(s.garbage_views.end(), garbage_views_.begin(), garbage_views_.end());
     garbage_views_.clear();
     recording_ = false;
-    upload_cache_.clear();
+    upload_cache_.Clear();
     sets_used_ = 0;
     // the next slot: wait for the submission it held (two submissions ago), then reuse it
     const int next = (cur_ + 1) % kSlots;
@@ -927,6 +1047,7 @@ void Renderer::Submit() {
 }
 
 void Renderer::Flush() {
+    stats_.sync_flushes++;
     Submit();
     for (Slot& s : slots_) Retire(s);
 }
@@ -1038,6 +1159,7 @@ ShaderEntry* Renderer::GetShader(const ShaderKey& key) {
     auto it = shaders_.find(h);
     if (it != shaders_.end()) return it->second.get();
     auto e = std::make_unique<ShaderEntry>();
+    e->key_hash = h;
     const uint32_t* code = reinterpret_cast<const uint32_t*>(key.code);
     const uint32_t* fetch = key.fetch ? reinterpret_cast<const uint32_t*>(key.fetch) : nullptr;
     e->t = Translate(key, code, fetch);
@@ -1368,7 +1490,11 @@ Texture* Renderer::GetTexture(const uint32_t* t, uint32_t& kind) {
         if (bytes == 0 || src_bytes > (96ull << 20)) {
             Skip("texture too large");
         } else if (Readable(addr, size_t(src_bytes))) {
-            const uint64_t hsh = SampleHash(addr, src_bytes);
+            // pages not written since the last check need no hash (write_watch.h)
+            const uint32_t lw = is_new ? kNotWatched : WriteWatchLastWrite(addr, src_bytes);
+            const bool unchanged = lw != kNotWatched && lw <= tex->watch_gen;
+            tex->watch_gen = ww_gen_;
+            const uint64_t hsh = unchanged ? tex->mem_hash : SampleHash(addr, src_bytes);
             if (is_new || hsh != tex->mem_hash) {
                 tex->mem_hash = hsh;
                 const uint64_t off = Alloc(bytes + 16ull * nlev, 16);
@@ -1473,7 +1599,7 @@ Texture* Renderer::GetTexture(const uint32_t* t, uint32_t& kind) {
 }
 
 bool Renderer::BindShaderResources(ShaderEntry* e, const std::vector<uint32_t>& sdata, const ResourceDescriptors& desc,
-                                   VkDescriptorSet& set, uint32_t max_records) {
+                                   VkDescriptorSet& set, uint32_t max_records, uint32_t min_records) {
     VkDescriptorSetAllocateInfo ai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
     ai.descriptorPool = dpool_;
     ai.descriptorSetCount = 1;
@@ -1597,25 +1723,69 @@ bool Renderer::BindShaderResources(ShaderEntry* e, const std::vector<uint32_t>& 
                                          ? std::min<uint64_t>(d[2], max_records) : d[2];
             uint64_t size = stride ? records * stride : d[2];
             size = std::min<uint64_t>(size, 32ull << 20);
-            const uint64_t alloc = size + 64;
+            // ... and none below the lowest index: a mesh drawn in many small pieces from one big vertex
+            // buffer would otherwise copy the buffer's whole prefix for every piece. The binding starts
+            // `skip` bytes before the copied data, so the shader's element indices stay the same.
+            uint64_t skip = 0;
+            if (r.kind == ResourceSlot::kVertexBuffer && r.vertex_indexed && stride && !r.written && min_records &&
+                uint64_t(min_records) * stride < size && uint64_t(min_records) * stride + 256 <= ring_off_ - ring_slot_base_)
+                skip = uint64_t(min_records) * stride;
+            const uint64_t copy = size - skip;
+            const uint64_t alloc = size + 64; // binding range, from the binding offset
             // read-only buffers are uploaded once per ring generation (several draws of a submission often
             // share the same vertex / constant / bone buffers)
-            uint64_t off = UINT64_MAX;
-            const UploadKey ukey{base, size};
+            uint64_t off = UINT64_MAX; // binding offset (the data starts at off + skip)
+            bool in_arena = false;     // the binding is in arena_ (resident copy), not in the ring
+            const UploadKey ukey{base, size, skip};
             if (!r.written)
-                if (auto it = upload_cache_.find(ukey); it != upload_cache_.end()) {
-                    off = it->second;
+                if (const uint64_t* hit = upload_cache_.Find(ukey)) {
+                    off = *hit & ~kArenaFlag;
+                    in_arena = (*hit & kArenaFlag) != 0;
                     stats_.upload_hits++;
                 }
+            if (off == UINT64_MAX && !r.written && copy >= kArenaMin && arena_.mapped) {
+                // Resident copies (write_watch.h): a buffer whose pages were not written since it was last
+                // seen is copied once into the arena and bound from there in later frames. Buffers that
+                // change every frame (bones, constants) never get there and keep using the ring.
+                const uint32_t lw = WriteWatchLastWrite(base + skip, copy);
+                if (lw != kNotWatched) {
+                    ArenaEntry& ae = arena_map_[ukey];
+                    if (ae.off != UINT64_MAX && lw <= ae.gen) {
+                        off = ae.off - skip;
+                        in_arena = true;
+                        stats_.arena_hits++;
+                    } else if (ae.seen && lw <= ae.gen) { // unchanged since the previous sighting: make it resident
+                        uint64_t dst = (arena_off_ + 255) & ~255ull;
+                        dst += skip ? ((256 - ((dst - skip) & 255)) & 255) : 0;
+                        if (dst >= skip && dst + copy + 64 <= arena_.size) {
+                            arena_off_ = dst + copy + 64;
+                            std::memset(static_cast<uint8_t*>(arena_.mapped) + dst + copy, 0, 64);
+                            SafeCopy(static_cast<uint8_t*>(arena_.mapped) + dst, base + skip, size_t(copy));
+                            stats_.arena_bytes += copy;
+                            ae.off = dst;
+                            ae.gen = ww_gen_;
+                            off = dst - skip;
+                            in_arena = true;
+                        }
+                    } else { // first sighting, or written since: the old resident copy (if any) is abandoned
+                        ae.seen = true;
+                        ae.off = UINT64_MAX;
+                        ae.gen = ww_gen_;
+                    }
+                }
+                if (in_arena) upload_cache_.Insert(ukey, off | kArenaFlag);
+            }
             if (off == UINT64_MAX) {
-                off = Alloc(alloc);
-                if (off == UINT64_MAX) return false;
-                std::memset(RingPtr(off + size), 0, 64);
-                if (size) SafeCopy(RingPtr(off), base, size_t(size));
-                stats_.upload_bytes += size;
-                if (!r.written) upload_cache_[ukey] = off;
+                uint64_t dst = Alloc(copy + 64 + (skip ? 256 : 0));
+                if (dst == UINT64_MAX) return false;
+                if (skip) dst += (256 - ((dst - skip) & 255)) & 255; // aligned binding offset
+                off = dst - skip;
+                std::memset(RingPtr(dst + copy), 0, 64);
+                if (copy) SafeCopy(RingPtr(dst), base + skip, size_t(copy));
+                stats_.upload_bytes += copy;
+                if (!r.written) upload_cache_.Insert(ukey, off);
                 static const bool ustats = std::getenv("GR_UPLOAD_STATS") != nullptr;
-                if (ustats && size >= (256u << 10)) { // Debug (GR_UPLOAD_STATS=1): biggest uploads at exit
+                if (ustats) { // Debug (GR_UPLOAD_STATS=1): biggest uploads at exit
                     auto& u = upload_stats_[{e->t->key.code, uint32_t(i)}];
                     u.bytes += size;
                     u.count++;
@@ -1661,7 +1831,7 @@ bool Renderer::BindShaderResources(ShaderEntry* e, const std::vector<uint32_t>& 
                           vals.c_str());
             }
             if (r.written && size) writebacks_.push_back({base, off, size});
-            bufs[i + 1] = {ring_.buffer, off, alloc};
+            bufs[i + 1] = {in_arena ? arena_.buffer : ring_.buffer, off, alloc};
             wr.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
             wr.pBufferInfo = &bufs[i + 1];
         }
@@ -1954,7 +2124,7 @@ bool Renderer::RunEsGs(const DrawInfo& d, const Regs& r) {
 }
 
 Pipeline* Renderer::GetComputePipeline(ShaderEntry* e) {
-    const uint64_t h = HashKey(e->t->key) ^ 0xC0C0C0C0ull;
+    const uint64_t h = e->key_hash ^ 0xC0C0C0C0ull;
     auto it = pipelines_.find(h);
     if (it != pipelines_.end()) return &it->second;
     Pipeline p;
@@ -2036,6 +2206,13 @@ void Renderer::Draw(const DrawInfo& d, const Regs& r) {
     if (!vs_addr || !Readable(vs_addr, 64)) { Skip("no vertex shader"); return; }
     if (ps_addr && !Readable(ps_addr, 64)) { Skip("unreadable pixel shader"); return; }
     Mark(7);
+    static const uint64_t dbg_skip_vs = [] { const char* e = std::getenv("GR_DEBUG_SKIP_VS"); return e ? std::strtoull(e, nullptr, 16) : 0ull; }();
+    if (dbg_skip_vs && vs_addr == dbg_skip_vs) { Skip("GR_DEBUG_SKIP_VS"); return; } // Debug: hide one vertex shader's draws
+    static const bool draw_stats = std::getenv("GR_DRAW_STATS") != nullptr;
+    if (draw_stats) { // Debug (GR_DRAW_STATS=1): draws per (VS, PS, index count) at exit
+        auto& n = draw_stats_[{vs_addr, ps_addr, d.index_count}];
+        ++n;
+    }
 
     uint32_t vs_user[16], ps_user[16];
     for (uint32_t i = 0; i < 16; ++i) {
@@ -2176,6 +2353,7 @@ void Renderer::Draw(const DrawInfo& d, const Regs& r) {
     // Highest vertex index the draw can fetch: bounds the vertex-buffer copies below. Computed from a
     // host copy: the ring buffer is write-combined memory and must never be read back by the CPU.
     uint32_t max_vertex = d.index_count ? d.index_count - 1 : 0;
+    uint32_t min_vertex = 0; // lowest one: index-fetched buffers are uploaded from there
     if (prim != 0x13 && d.index_base && !gs_.active) {
         const uint64_t bytes = uint64_t(count) * (d.index_type == 1 ? 4 : 2);
         ib_off = Alloc(bytes + 4, 4);
@@ -2184,32 +2362,37 @@ void Renderer::Draw(const DrawInfo& d, const Regs& r) {
         SafeCopy(index_tmp_.data(), d.index_base, size_t(bytes));
         std::memcpy(RingPtr(ib_off), index_tmp_.data(), size_t(bytes));
         max_vertex = 0;
+        min_vertex = UINT32_MAX;
         if (itype == VK_INDEX_TYPE_UINT32) {
             const auto* ix = index_tmp_.data();
-            for (uint32_t i = 0; i < count; ++i) max_vertex = std::max(max_vertex, ix[i]);
+            for (uint32_t i = 0; i < count; ++i) { max_vertex = std::max(max_vertex, ix[i]); min_vertex = std::min(min_vertex, ix[i]); }
         } else {
             const auto* ix = reinterpret_cast<const uint16_t*>(index_tmp_.data());
-            for (uint32_t i = 0; i < count; ++i) max_vertex = std::max<uint32_t>(max_vertex, ix[i]);
+            for (uint32_t i = 0; i < count; ++i) {
+                max_vertex = std::max<uint32_t>(max_vertex, ix[i]);
+                min_vertex = std::min<uint32_t>(min_vertex, ix[i]);
+            }
         }
     } else if (prim == 0x13 && d.index_base) {
         max_vertex = 0xFFFF; // quad lists are rare; keep the full buffers
     }
     const uint32_t max_records = std::max(max_vertex + 1, std::max<uint32_t>(d.num_instances, 1));
+    const uint32_t min_records = d.num_instances > 1 || min_vertex == UINT32_MAX ? 0 : min_vertex;
 
     Mark(3);
     // ---- resources (may record uploads/copies, so before rendering begins)
     VkDescriptorSet vs_set = VK_NULL_HANDLE, ps_set = VK_NULL_HANDLE;
     aux_off_ = gs_.aux_off;
     aux_size_ = gs_.aux_size;
-    if (!BindShaderResources(vs, vs_sdata, vs_desc, vs_set, gs_.active ? ~0u : max_records)) { Skip("vertex resources"); return; }
+    if (!BindShaderResources(vs, vs_sdata, vs_desc, vs_set, gs_.active ? ~0u : max_records, gs_.active ? 0u : min_records)) { Skip("vertex resources"); return; }
     if (ps && !BindShaderResources(ps, ps_sdata, ps_desc, ps_set, ~0u)) { Skip("pixel resources"); return; }
 
     Mark(4);
     // ---- pipeline
     PipeKey pk;
     std::memset(&pk, 0, sizeof pk);
-    pk.vs = HashKey(vs->t->key);
-    pk.ps = ps ? HashKey(ps->t->key) : 0;
+    pk.vs = vs->key_hash;
+    pk.ps = ps ? ps->key_hash : 0;
     pk.ncolor = ncolor;
     for (uint32_t i = 0; i < ncolor; ++i) {
         pk.color[i] = att[i].rt ? att[i].fmt : VK_FORMAT_UNDEFINED;
@@ -2285,6 +2468,7 @@ void Renderer::Draw(const DrawInfo& d, const Regs& r) {
         ri.pDepthAttachment = dt ? &dai : nullptr;
         ri.pStencilAttachment = dt ? &dai : nullptr;
         vkCmdBeginRendering(c, &ri);
+        stats_.passes++;
         pass_ = want;
     }
     vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe->pipe);
@@ -2336,6 +2520,7 @@ void Renderer::Draw(const DrawInfo& d, const Regs& r) {
         vkCmdDraw(c, count, inst, 0, 0);
     }
     if (query) vkCmdEndQuery(c, qpool_, qcount_++);
+    GpuProfileDraw(c, vs_addr, ps_addr);
     // the pass stays open for the next draw, unless this one stored to memory a later draw may read
     if (!writebacks_.empty() || !written_images_.empty()) EndPass();
     for (uint32_t i = 0; i < ncolor; ++i)
@@ -2348,15 +2533,22 @@ void Renderer::Draw(const DrawInfo& d, const Regs& r) {
 void Renderer::Flip(int32_t index) {
     struct Acc { double t0; double& acc; ~Acc() { acc += NowMs() - t0; } } acc{NowMs(), stats_.flip_ms};
     stats_.flips++;
+    WriteWatchCollect(++ww_gen_); // stamps the guest pages written during the previous frame
+    if (init_ok_) ResetArenaIfFull();
     { // frame rate every 5 s, with the host time split of that window (profiling)
-        static double t0 = NowMs(), d0 = 0, w0 = 0;
-        static uint64_t f0 = 0, n0 = 0;
+        static double t0 = NowMs(), d0 = 0, w0 = 0, g0 = 0;
+        static uint64_t f0 = 0, n0 = 0, s0 = 0, p0 = 0, c0 = 0, u0 = 0, y0 = 0;
         const double now = NowMs();
         if (now - t0 >= 5000) {
-            TraceNote("renderer: %.1f fps at flip %llu (last 5 s: %.0f ms recording, %.0f ms waiting for the GPU, %.0f draws per flip)",
+            const double nf = double(std::max<uint64_t>(stats_.flips - f0, 1));
+            TraceNote("renderer: %.1f fps at flip %llu, submission %llu (last 5 s: %.0f ms recording, %.0f ms waiting for the GPU; "
+                      "per flip: %.1f ms of GPU work, %.0f draws, %.0f passes, %.1f RT copies, %.1f texture uploads, %.1f submissions, %.1f synchronous flushes)",
                       double(stats_.flips - f0) * 1000.0 / (now - t0), (unsigned long long)stats_.flips,
-                      stats_.draw_ms - d0, stats_.wait_ms - w0, double(stats_.draws - n0) / double(std::max<uint64_t>(stats_.flips - f0, 1)));
-            t0 = now; f0 = stats_.flips; d0 = stats_.draw_ms; w0 = stats_.wait_ms; n0 = stats_.draws;
+                      (unsigned long long)submit_index_, stats_.draw_ms - d0, stats_.wait_ms - w0, (stats_.gpu_ms - g0) / nf, double(stats_.draws - n0) / nf,
+                      double(stats_.passes - p0) / nf, double(stats_.tex_rt_copies - c0) / nf, double(stats_.tex_uploads - u0) / nf,
+                      double(submit_index_ - s0) / nf, double(stats_.sync_flushes - y0) / nf);
+            t0 = now; f0 = stats_.flips; d0 = stats_.draw_ms; w0 = stats_.wait_ms; n0 = stats_.draws; s0 = submit_index_;
+            p0 = stats_.passes; c0 = stats_.tex_rt_copies; u0 = stats_.tex_uploads; g0 = stats_.gpu_ms; y0 = stats_.sync_flushes;
         }
     }
     if (!Init()) return;
@@ -2561,19 +2753,33 @@ std::string Renderer::StatsText() {
                   (unsigned long long)stats_.flips, (unsigned long long)stats_.flips_out,
                   (unsigned long long)stats_.dumped);
     std::string s = buf;
+    uint32_t ww_regions = 0;
+    const double ww_mb = double(WriteWatchBytes(&ww_regions)) / 1048576.0;
     std::snprintf(buf, sizeof buf, "\n  host time: %.0f ms recording draws, %.0f ms waiting for the GPU, %.0f ms in flips; "
-                                   "%.0f MB of buffers uploaded, %llu uploads reused",
+                                   "%.0f MB of buffers uploaded, %llu uploads reused, %llu resident-buffer hits (%.0f MB made resident, %llu arena resets); faulting guest reads: %llu copies, %llu pre-exec; %.0f ms collecting written pages (%u allocations, %.0f MB watched)",
                   stats_.draw_ms, stats_.wait_ms, stats_.flip_ms, double(stats_.upload_bytes) / 1048576.0,
-                  (unsigned long long)stats_.upload_hits);
+                  (unsigned long long)stats_.upload_hits, (unsigned long long)stats_.arena_hits,
+                  double(stats_.arena_bytes) / 1048576.0, (unsigned long long)stats_.arena_resets, (unsigned long long)g_copy_faults,
+                  (unsigned long long)g_read_faults, WriteWatchCollectMs(), ww_regions, ww_mb);
     s += buf;
     if (!upload_stats_.empty()) {
         std::vector<std::pair<std::pair<uint64_t, uint32_t>, UploadStat>> v(upload_stats_.begin(), upload_stats_.end());
         std::sort(v.begin(), v.end(), [](const auto& x, const auto& y) { return x.second.bytes > y.second.bytes; });
-        for (size_t k = 0; k < v.size() && k < 12; ++k) {
+        for (size_t k = 0; k < v.size() && k < 25; ++k) {
             std::snprintf(buf, sizeof buf, "\n    upload: shader 0x%llx res %u kind %d w3 %08x: %.0f MB in %llu uploads (last %llu bytes)",
                           (unsigned long long)v[k].first.first, v[k].first.second, v[k].second.kind, v[k].second.w3,
                           double(v[k].second.bytes) / 1048576.0, (unsigned long long)v[k].second.count,
                           (unsigned long long)v[k].second.last_size);
+            s += buf;
+        }
+    }
+    if (!draw_stats_.empty()) {
+        std::vector<std::pair<std::tuple<uint64_t, uint64_t, uint32_t>, uint64_t>> v(draw_stats_.begin(), draw_stats_.end());
+        std::sort(v.begin(), v.end(), [](const auto& x, const auto& y) { return x.second > y.second; });
+        for (size_t k = 0; k < v.size() && k < 30; ++k) {
+            std::snprintf(buf, sizeof buf, "\n    draws: VS 0x%llx PS 0x%llx count %u: %llu",
+                          (unsigned long long)std::get<0>(v[k].first), (unsigned long long)std::get<1>(v[k].first),
+                          std::get<2>(v[k].first), (unsigned long long)v[k].second);
             s += buf;
         }
     }
