@@ -1622,6 +1622,8 @@ void BuildPreExec(TranslatedShader& s) {
         if (op.kind == Op::kNone && op.res_begin == op.res_end) continue;
         s.pre_ops.push_back(op);
     }
+    s.pre_branches = false;
+    for (const Op& op : s.pre_ops) s.pre_branches |= op.kind == Op::kBranch;
     // branch targets: first op at or after the target instruction (the ones in between do nothing)
     for (Op& op : s.pre_ops) {
         if (op.kind != Op::kBranch || op.target < 0) continue;
@@ -1682,6 +1684,7 @@ void ScalarPreExecute(const TranslatedShader& s, const uint32_t* user_sgprs, std
         bool scc = false;
         for (size_t i = 0; i < n; ++i) step(s.pre_ops[i], S, scc);
     }
+    if (!s.pre_branches) return; // straight-line code: pass 2 would see exactly the same values
     // Pass 2, following the scalar control flow: SCC branches are decided with the known values,
     // VCCZ/EXECZ branches are taken as falling through. The values seen on this path replace pass 1
     // (a register reused for another purpose on a skipped path must not leak into a resource).

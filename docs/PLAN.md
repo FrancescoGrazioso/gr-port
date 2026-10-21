@@ -502,6 +502,8 @@ meshes, 6-100 indices each), so the per-draw host cost decides. In order of payo
      frames; buffers written every frame (bones, constants) stay in the ring. Arena entries are
      never overwritten, so in-flight frames stay valid; when the arena is 90% full it is emptied
      at a flip after waiting for the GPU (36 → 49 fps, uploads 82 → 15 GB per 75 s).
+5. Section timers in Draw only with `GR_DRAW_SECTIONS=1`, and one pre-execution pass for shaders without
+   scalar branches (49 → 53 fps).
 Remaining per-draw costs (profile): `GetTexture` (~20% with the RT-copy and lookup work), scalar
 pre-execution (~12%), copies of the remaining small buffers, descriptor writes. Latency: four
 slots let the GPU run up to two frames behind the game; if input lag shows, the flip submission

@@ -100,6 +100,7 @@ struct TranslatedShader {
     };
     std::vector<PreOp> pre_ops;
     std::vector<uint16_t> pre_res;
+    bool pre_branches = false; // pre_ops has scalar branches (otherwise one pass suffices)
 };
 
 constexpr uint32_t kSgprCount = 104;

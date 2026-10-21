@@ -50,6 +50,7 @@ GPU work is split into submissions that alternate between rendering and flips, s
 | `GR_PROFILE=gfx[,compute]` or `1`, `GR_PROFILE_FROM=<s>` | sampling profiler (~1 kHz) for the GPU worker threads, starting S seconds after launch; the top functions (self and inclusive) are printed at exit. Every 5 s the trace gets a `renderer: N fps at flip ...` line: host time recording / waiting for the GPU, and per flip the GPU time (timestamps), draws, rendering passes, render-target copies, texture uploads, submissions and synchronous flushes |
 | `GR_GPU_PROFILE=<submission>` | GPU timestamp after every draw of that submission; the most expensive (VS, PS) pairs go to the trace |
 | `GR_DRAW_STATS=1` | draw counts per (VS, PS, index count), at exit |
+| `GR_DRAW_SECTIONS=1` | host time per section of Draw (setup, shaders, pre-exec, ...), at exit; off by default because the timer reads cost ~5% |
 | `GR_DEBUG_SKIP_VS=<hex>` | skips every draw of one vertex shader (find out what it draws) |
 | `GR_NO_WRITE_WATCH=1` | disables guest write tracking: textures are hashed and buffers copied every frame (see `loader/write_watch.h`) |
 | `GR_DEBUG_GS_FLIP=1` | inverts the front face of every geometry-pipeline (ES/GS) draw, to check strip winding |

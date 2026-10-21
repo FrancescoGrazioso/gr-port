@@ -711,7 +711,13 @@ public:
     std::vector<Writeback> writebacks_;
     // per-section host time inside Draw (profiling)
     double sec_[8] = {}, mark_last_ = 0;
+    // GR_DRAW_SECTIONS=1 only: reading the timer nine times per draw costs ~5% with 7000 draws a frame
+    static bool SectionTimes() {
+        static const bool on = std::getenv("GR_DRAW_SECTIONS") != nullptr;
+        return on;
+    }
     void Mark(int i) {
+        if (!SectionTimes()) return;
         const double n = NowMs();
         sec_[i] += n - mark_last_;
         mark_last_ = n;
@@ -2155,7 +2161,7 @@ Pipeline* Renderer::GetComputePipeline(ShaderEntry* e) {
 void Renderer::Draw(const DrawInfo& d, const Regs& r) {
     const double t0 = NowMs();
     struct Acc { double t0; double& acc; ~Acc() { acc += NowMs() - t0; } } acc{t0, stats_.draw_ms};
-    mark_last_ = t0;
+    if (SectionTimes()) mark_last_ = t0;
     written_images_.clear(); // stores from VS/PS are not tracked yet
     writebacks_.clear();
     stats_.draws++;
@@ -2789,10 +2795,13 @@ std::string Renderer::StatsText() {
                   (unsigned long long)stats_.dispatches, (unsigned long long)stats_.dispatched,
                   (unsigned long long)stats_.writebacks, (unsigned long long)stats_.tiny_readbacks, (unsigned long long)stats_.gs_draws);
     s += buf;
-    std::snprintf(buf, sizeof buf,
-                  "\n  draw sections (ms): setup %.0f, shaders %.0f, pre-exec %.0f, targets/indices %.0f, resources %.0f, "
-                  "pipeline %.0f, record %.0f (readable checks %.0f)",
-                  sec_[0], sec_[1], sec_[2], sec_[3], sec_[4], sec_[5], sec_[6], sec_[7]);
+    buf[0] = 0;
+    if (SectionTimes())
+        std::snprintf(buf, sizeof buf,
+                      "\n  draw sections (ms): setup %.0f, shaders %.0f, pre-exec %.0f, targets/indices %.0f, resources %.0f, "
+                      "pipeline %.0f, record %.0f (readable checks %.0f)",
+                      sec_[0], sec_[1], sec_[2], sec_[3], sec_[4], sec_[5], sec_[6], sec_[7]);
+    else buf[0] = 0;
     s += buf;
     for (const auto& [why, n] : stats_.skip_reasons) s += "\n  " + why + ": " + std::to_string(n);
     return s;
