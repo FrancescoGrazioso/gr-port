@@ -47,6 +47,7 @@ GPU work is split into submissions that alternate between rendering and flips, s
 | `GR_DEBUG_NODEPTH=<hex VS>` / `GR_DEBUG_NOKILL=<hex PS>` | disables the depth test / pixel kill for one shader |
 | `GR_DEBUG_UNREADABLE_ONE=1` | fills textures that cannot be read with 1.0 instead of 0 |
 | `GR_UPLOAD_STATS=1` | lists the shader resources with the most buffer bytes uploaded from guest memory, at exit |
+| `GR_PROFILE=gfx[,compute]` or `1`, `GR_PROFILE_FROM=<s>` | sampling profiler (~1 kHz) for the GPU worker threads, starting S seconds after launch; the top functions (self and inclusive) are printed at exit. Frame rate, host time split and draws per flip go to the trace every 5 s (`renderer: N fps at flip ...`) |
 | `GR_DEBUG_GS_FLIP=1` | inverts the front face of every geometry-pipeline (ES/GS) draw, to check strip winding |
 | `GR_DEBUG_BLACK_TEX=<hex shader>:<resource>` | binds a black texture in place of one texture of one shader (isolate shader terms) |
 | `GR_AUDIO_DUMP=<file.wav>` | records the mixed sceAudioOut output (works with `--mute`), so a test can check that sound is produced |

@@ -6,7 +6,9 @@
 #include <cstdlib>
 #include <cstdio>
 #include <cstring>
+#include <algorithm>
 #include <map>
+#include <unordered_map>
 #include <mutex>
 #include <set>
 
@@ -1452,6 +1454,8 @@ void ExecSalu(const Instr& in, uint32_t* S, bool& scc, uint64_t code_addr) {
 
 // ---------------------------------------------------------------------------------------------------------
 
+void BuildPreExec(TranslatedShader& s);
+
 std::unique_ptr<TranslatedShader> Translate(const ShaderKey& key, const uint32_t* code, const uint32_t* fetch_code) {
     auto t = std::make_unique<TranslatedShader>();
     t->key = key;
@@ -1548,6 +1552,7 @@ std::unique_ptr<TranslatedShader> Translate(const ShaderKey& key, const uint32_t
     if (t->resources.size() > 64) { t->error = "too many resources"; return t; }
     t->sdata_dwords = sdata;
     t->num_vgprs = std::min<uint32_t>(std::max<uint32_t>(max_v + 4, 24), 256);
+    BuildPreExec(*t);
 
     t->glsl = gen.Run();
     std::string log;
@@ -1555,8 +1560,62 @@ std::unique_ptr<TranslatedShader> Translate(const ShaderKey& key, const uint32_t
     return t;
 }
 
+// Builds TranslatedShader::pre_ops: what ScalarPreExecute runs for every draw, so the per-draw work
+// skips vector instructions and needs no lookup tables.
+void BuildPreExec(TranslatedShader& s) {
+    using Op = TranslatedShader::PreOp;
+    const size_t n = s.program.size();
+    std::vector<int> smrd_of(n, -1);
+    for (size_t k = 0; k < s.smrd.size(); ++k)
+        if (s.smrd[k].instr < n) smrd_of[s.smrd[k].instr] = int(k);
+    std::vector<std::vector<uint16_t>> res_at(n);
+    for (size_t r = 0; r < s.resources.size(); ++r)
+        if (s.resources[r].instr < n) res_at[s.resources[r].instr].push_back(uint16_t(r));
+    std::unordered_map<uint32_t, size_t> index_of;
+    for (size_t i = 0; i < n; ++i) index_of.emplace(s.program[i].pc, i);
+    s.pre_ops.clear();
+    s.pre_res.clear();
+    std::vector<size_t> branch_instr; // pre_ops index → target instruction (resolved below)
+    for (size_t i = 0; i < n; ++i) {
+        const Instr& in = s.program[i];
+        Op op{Op::kNone, uint32_t(i), -1, -1, uint16_t(s.pre_res.size()), 0};
+        switch (in.fmt) {
+        case Fmt::SOP2:
+        case Fmt::SOP1:
+        case Fmt::SOPK:
+        case Fmt::SOPC: op.kind = Op::kSalu; break;
+        case Fmt::SMRD:
+            if (smrd_of[i] >= 0) { op.kind = Op::kSmrd; op.smrd = smrd_of[i]; }
+            else if (in.op == 30) op.kind = Op::kMemtime;
+            break;
+        case Fmt::SOPP:
+            if (in.op == 1) op.kind = Op::kEnd;
+            else if (IsBranch(in)) {
+                op.kind = Op::kBranch;
+                auto it = index_of.find(BranchTarget(in));
+                op.target = it == index_of.end() ? -1 : int32_t(it->second); // instruction index for now
+            }
+            break;
+        default: break;
+        }
+        for (uint16_t r : res_at[i]) s.pre_res.push_back(r);
+        op.res_end = uint16_t(s.pre_res.size());
+        if (op.kind == Op::kNone && op.res_begin == op.res_end) continue;
+        s.pre_ops.push_back(op);
+    }
+    // branch targets: first op at or after the target instruction (the ones in between do nothing)
+    for (Op& op : s.pre_ops) {
+        if (op.kind != Op::kBranch || op.target < 0) continue;
+        const uint32_t ti = uint32_t(op.target);
+        const auto it = std::lower_bound(s.pre_ops.begin(), s.pre_ops.end(), ti,
+                                         [](const Op& o, uint32_t v) { return o.instr < v; });
+        op.target = int32_t(it - s.pre_ops.begin());
+    }
+}
+
 void ScalarPreExecute(const TranslatedShader& s, const uint32_t* user_sgprs, std::vector<uint32_t>& sdata,
                       ResourceDescriptors& out) {
+    using Op = TranslatedShader::PreOp;
     uint32_t S0[kSArray] = {};
     const uint32_t nuser = std::min<uint32_t>(s.key.user_sgprs, 16);
     for (uint32_t i = 0; i < nuser; ++i) S0[i] = user_sgprs[i];
@@ -1565,82 +1624,68 @@ void ScalarPreExecute(const TranslatedShader& s, const uint32_t* user_sgprs, std
     std::memcpy(sdata.data(), S0, kSgprCount * 4);
     out.values.assign(s.resources.size(), {});
 
-    const size_t n = s.program.size();
-    std::vector<int> smrd_of(n, -1);
-    for (size_t k = 0; k < s.smrd.size(); ++k)
-        if (s.smrd[k].instr < n) smrd_of[s.smrd[k].instr] = int(k);
-    std::vector<std::vector<size_t>> res_at(n);
-    for (size_t r = 0; r < s.resources.size(); ++r)
-        if (s.resources[r].instr < n) res_at[s.resources[r].instr].push_back(r);
-
     // One scalar instruction. Resources are captured with the SGPR values seen when the instruction
     // that uses them is reached.
-    auto step = [&](size_t i, uint32_t* S, bool& scc) {
-        const Instr& in = s.program[i];
-        for (size_t r : res_at[i]) {
+    auto step = [&](const Op& op, uint32_t* S, bool& scc) {
+        for (uint16_t k = op.res_begin; k < op.res_end; ++k) {
+            const uint16_t r = s.pre_res[k];
             const uint16_t g = s.resources[r].sgpr;
-            for (uint32_t k = 0; k < 8 && g + k < kSArray; ++k) out.values[r][k] = S[g + k];
+            for (uint32_t j = 0; j < 8 && g + j < kSArray; ++j) out.values[r][j] = S[g + j];
         }
-        switch (in.fmt) {
-        case Fmt::SOP2:
-        case Fmt::SOP1:
-        case Fmt::SOPK:
-        case Fmt::SOPC: ExecSalu(in, S, scc, s.key.code); break;
-        case Fmt::SMRD: {
-            if (smrd_of[i] >= 0) {
-                const SmrdSlot& sl = s.smrd[size_t(smrd_of[i])];
-                const uint32_t off = in.smrd_imm ? in.smrd_offset * 4 : (in.smrd_offset < kSArray ? S[in.smrd_offset] : 0);
-                uint64_t base;
-                if (in.op >= 8) base = uint64_t(S[in.sbase]) | (uint64_t(S[in.sbase + 1] & 0xFFFF) << 32);
-                else base = (uint64_t(S[in.sbase]) | (uint64_t(S[in.sbase + 1] & 0xFFFF) << 32)) & ~3ull; // 48-bit address: a V# used as a pointer keeps its stride in the high bits
-                uint32_t* dst = sdata.data() + sl.sdata_index;
-                SafeRead(base + off, dst, sl.dwords * 4);
-                for (uint32_t k = 0; k < sl.dwords && in.dst + k < kSArray; ++k) S[in.dst + k] = dst[k];
-            } else if (in.op == 30) {
-                S[in.dst] = 0;
-                if (in.dst + 1 < kSArray) S[in.dst + 1] = 0;
-            }
+        const Instr& in = s.program[op.instr];
+        switch (op.kind) {
+        case Op::kSalu: ExecSalu(in, S, scc, s.key.code); break;
+        case Op::kSmrd: {
+            const SmrdSlot& sl = s.smrd[size_t(op.smrd)];
+            const uint32_t off = in.smrd_imm ? in.smrd_offset * 4 : (in.smrd_offset < kSArray ? S[in.smrd_offset] : 0);
+            uint64_t base;
+            if (in.op >= 8) base = uint64_t(S[in.sbase]) | (uint64_t(S[in.sbase + 1] & 0xFFFF) << 32);
+            else base = (uint64_t(S[in.sbase]) | (uint64_t(S[in.sbase + 1] & 0xFFFF) << 32)) & ~3ull; // 48-bit address: a V# used as a pointer keeps its stride in the high bits
+            uint32_t* dst = sdata.data() + sl.sdata_index;
+            SafeRead(base + off, dst, sl.dwords * 4);
+            for (uint32_t k = 0; k < sl.dwords && in.dst + k < kSArray; ++k) S[in.dst + k] = dst[k];
             break;
         }
+        case Op::kMemtime:
+            S[in.dst] = 0;
+            if (in.dst + 1 < kSArray) S[in.dst + 1] = 0;
+            break;
         default: break;
         }
     };
 
+    const size_t n = s.pre_ops.size();
     // Pass 1, program order: gives every SMRD and resource a value, including code that pass 2
     // does not reach (vector-dependent branches).
     {
         uint32_t S[kSArray];
         std::memcpy(S, S0, sizeof S);
         bool scc = false;
-        for (size_t i = 0; i < n; ++i) step(i, S, scc);
+        for (size_t i = 0; i < n; ++i) step(s.pre_ops[i], S, scc);
     }
     // Pass 2, following the scalar control flow: SCC branches are decided with the known values,
     // VCCZ/EXECZ branches are taken as falling through. The values seen on this path replace pass 1
     // (a register reused for another purpose on a skipped path must not leak into a resource).
     {
-        std::map<uint32_t, size_t> index_of;
-        for (size_t i = 0; i < n; ++i) index_of[s.program[i].pc] = i;
         uint32_t S[kSArray];
         std::memcpy(S, S0, sizeof S);
         bool scc = false;
         size_t i = 0;
         for (uint32_t steps = 0; i < n && steps < 200000; ++steps) {
-            const Instr& in = s.program[i];
-            if (in.fmt == Fmt::SOPP) {
-                if (in.op == 1) break; // s_endpgm
-                if (IsBranch(in)) {
-                    const bool taken = in.op == 2 || (in.op == 4 && !scc) || (in.op == 5 && scc);
-                    if (taken) {
-                        auto it = index_of.find(BranchTarget(in));
-                        if (it == index_of.end()) break;
-                        i = it->second;
-                        continue;
-                    }
+            const Op& op = s.pre_ops[i];
+            if (op.kind == Op::kEnd) break; // s_endpgm
+            if (op.kind == Op::kBranch) {
+                const Instr& in = s.program[op.instr];
+                const bool taken = in.op == 2 || (in.op == 4 && !scc) || (in.op == 5 && scc);
+                if (taken) {
+                    if (op.target < 0) break;
+                    i = size_t(op.target);
+                    continue;
                 }
                 ++i;
                 continue;
             }
-            step(i, S, scc);
+            step(op, S, scc);
             ++i;
         }
     }

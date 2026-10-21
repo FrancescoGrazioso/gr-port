@@ -88,6 +88,18 @@ struct TranslatedShader {
     std::vector<uint32_t> spirv;
     std::string error;    // translation / compilation failed
     std::string warnings; // unsupported instructions that were skipped
+
+    // Scalar pre-execution program (built once by Translate, run for every draw by ScalarPreExecute):
+    // the instructions that change scalar state or capture resource descriptors, in program order.
+    struct PreOp {
+        enum Kind : uint8_t { kSalu, kSmrd, kMemtime, kEnd, kBranch, kNone } kind;
+        uint32_t instr;              // index into program
+        int32_t smrd;                // kSmrd: index into smrd
+        int32_t target;              // kBranch: index into pre_ops (-1 = outside the program)
+        uint16_t res_begin, res_end; // range of pre_res: resources captured at this instruction
+    };
+    std::vector<PreOp> pre_ops;
+    std::vector<uint16_t> pre_res;
 };
 
 constexpr uint32_t kSgprCount = 104;

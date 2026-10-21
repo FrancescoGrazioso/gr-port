@@ -59,6 +59,7 @@ struct Buffer {
     VkDeviceMemory memory = VK_NULL_HANDLE;
     void* mapped = nullptr;
     VkDeviceSize size = 0;
+    VkMemoryPropertyFlags mem_flags = 0;
 };
 
 struct Image {
@@ -90,7 +91,9 @@ public:
 
     uint32_t FindMemoryType(uint32_t type_bits, VkMemoryPropertyFlags flags) const;
     static uint32_t FindMemoryType(VkPhysicalDevice gpu, uint32_t type_bits, VkMemoryPropertyFlags flags);
-    Buffer CreateBuffer(VkDeviceSize size, VkBufferUsageFlags usage, bool host_visible);
+    // host_visible buffers may also ask for extra properties (DEVICE_LOCAL for buffers the GPU reads a lot,
+    // HOST_CACHED for read-backs); without a matching memory type they get plain host memory.
+    Buffer CreateBuffer(VkDeviceSize size, VkBufferUsageFlags usage, bool host_visible, VkMemoryPropertyFlags prefer = 0);
     void DestroyBuffer(Buffer& b);
     Image CreateImage(VkFormat fmt, uint32_t w, uint32_t h, uint32_t mips, VkImageUsageFlags usage,
                       VkImageAspectFlags aspect = VK_IMAGE_ASPECT_COLOR_BIT, VkImageCreateFlags flags = 0);

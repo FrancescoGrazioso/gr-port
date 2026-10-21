@@ -168,7 +168,7 @@ uint32_t Device::FindMemoryType(VkPhysicalDevice gpu, uint32_t type_bits, VkMemo
     return UINT32_MAX;
 }
 
-Buffer Device::CreateBuffer(VkDeviceSize size, VkBufferUsageFlags usage, bool host_visible) {
+Buffer Device::CreateBuffer(VkDeviceSize size, VkBufferUsageFlags usage, bool host_visible, VkMemoryPropertyFlags prefer) {
     Buffer b;
     b.size = size;
     VkBufferCreateInfo ci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
@@ -179,10 +179,18 @@ Buffer Device::CreateBuffer(VkDeviceSize size, VkBufferUsageFlags usage, bool ho
     vkGetBufferMemoryRequirements(device_, b.buffer, &req);
     VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
     ai.allocationSize = req.size;
-    ai.memoryTypeIndex = FindMemoryType(req.memoryTypeBits, host_visible ? VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
-                                                                               VK_MEMORY_PROPERTY_HOST_COHERENT_BIT
-                                                                         : VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-    vkAllocateMemory(device_, &ai, nullptr, &b.memory);
+    const VkMemoryPropertyFlags need = host_visible ? VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT
+                                                    : VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+    VkResult res = VK_ERROR_OUT_OF_DEVICE_MEMORY;
+    if (prefer && host_visible) {
+        ai.memoryTypeIndex = FindMemoryType(req.memoryTypeBits, need | prefer);
+        if (ai.memoryTypeIndex != UINT32_MAX) res = vkAllocateMemory(device_, &ai, nullptr, &b.memory);
+    }
+    if (res != VK_SUCCESS) {
+        ai.memoryTypeIndex = FindMemoryType(req.memoryTypeBits, need);
+        vkAllocateMemory(device_, &ai, nullptr, &b.memory);
+    }
+    b.mem_flags = mem_props_.memoryTypes[ai.memoryTypeIndex].propertyFlags;
     vkBindBufferMemory(device_, b.buffer, b.memory, 0);
     if (host_visible) vkMapMemory(device_, b.memory, 0, VK_WHOLE_SIZE, 0, &b.mapped);
     return b;

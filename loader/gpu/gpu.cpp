@@ -1,4 +1,5 @@
 #include "gpu.h"
+#include "profiler.h"
 
 #include <windows.h>
 
@@ -426,6 +427,7 @@ void ProcessWork(Work& w) {
 void Worker(Queue* q, const char* name) {
     SetThreadDescription(GetCurrentThread(), name[0] == 'g' ? L"gr-gpu-gfx" : L"gr-gpu-compute");
     t_gfx_thread = name[0] == 'g';
+    ProfileThisThread(name);
     for (;;) {
         Work w;
         {

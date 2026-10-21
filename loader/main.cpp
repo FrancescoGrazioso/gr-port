@@ -29,6 +29,7 @@
 #include "kernel/audio_out.h"
 #include "linker.h"
 #include "nid.h"
+#include "profiler.h"
 #include "tls.h"
 #include "vk_window.h"
 
@@ -307,6 +308,7 @@ int main(int argc, char** argv) {
     if (run) std::printf("%s\n", gr::gpu::StatsSummary().c_str());
     if (run) std::printf("%s\n", gr::gpu::RendererStats().c_str());
     if (run) PrintCallSummary(hle);
+    if (run) std::printf("%s\n", gr::ProfileReport().c_str());
     std::fflush(stdout);
     ExitProcess(UINT(rc)); // guest threads may still be running
 }

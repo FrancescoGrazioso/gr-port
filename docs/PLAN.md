@@ -449,7 +449,41 @@ code: see [MODDING_AND_TESTING.md](MODDING_AND_TESTING.md). Real saves (the game
 start of each episode except `ep01_a`) are the next checkpoint mechanism; emulator-level save states
 are not planned.
 
-**Performance notes (2026-10-20).** Courtyard gameplay runs at ~28 fps windowed. A 110 s no-window
+**Performance (2026-10-21): courtyard gameplay at a steady 60 fps**, windowed and without a window
+(it was ~5 fps in the same scene, which the 2026-10-20 notes had measured as ~28). Measured with
+the built-in sampling profiler (`GR_PROFILE=gfx`, see DEBUGGING.md) and the 5-second frame-rate
+lines in the trace, always on the same scene (courtyard, ~700 draws per flip). In order of payoff:
+1. **One rendering pass for consecutive draws.** Every draw used to begin and end its own dynamic
+   rendering pass behind a full pipeline barrier, so the GPU drained between draws (~100 ms of GPU
+   time per frame). Now a pass stays open while draws target the same attachments: every command
+   recorded outside a draw goes through `Cmd()`, which ends the open pass first, so attachment
+   layouts and draw ordering stay correct; a draw that stores to memory ends the pass after itself.
+   Textures already in `SHADER_READ_ONLY` no longer record a barrier (that would end the pass).
+2. **Scalar pre-execution tables built once per shader.** `ScalarPreExecute` rebuilt per draw a
+   map of every instruction address and per-instruction resource lists (heap traffic was ~30% of
+   the GPU thread). `Translate` now builds `pre_ops`, the list of scalar instructions, branches
+   (with resolved targets) and resource captures; pre-exec time fell from 21 s to 3.5 s per run.
+3. **CPU and GPU overlap.** Two submission slots (command buffer, fence, descriptor pool, half of
+   the upload ring, retired images, deferred read-backs): `Submit()` queues a slot and reuses the
+   other once its fence has signalled, so the GPU runs a submission while the next is recorded.
+   `Flush()` (Submit + wait) remains for paths that read results on the CPU: compute write-backs,
+   frame dumps, the cross-GPU presenter's CPU frames, RenderDoc and draw traces. Tiny render-target
+   read-backs (auto-exposure) now reach guest memory when their slot is retired, about a frame
+   later. The presenter needs no extra sync: it blits the output image in a later submission on
+   the same queue, after the renderer's barrier. GPU waits went from ~25% of the thread to ~0.
+4. Smaller items: the upload ring prefers device-local host-visible memory (ReBAR), read-backs
+   prefer cached memory, shader code hashes are computed once per submission per address, the
+   texture content hash runs four independent lanes, and per-draw vectors are reused.
+
+The GPU thread is now busy ~50% of the time at 60 fps in the courtyard (recording 2.6 s per 5 s).
+Next candidates, from the profile: texture lookups (`GetTexture`, ~13%, including the per-submission
+content hashes), buffer uploads from guest memory (~12%, ~2 GB/s: a cross-submission cache needs
+page write-tracking to be cheaper than the copy, because hashing a buffer costs about as much as
+copying it), `UploadKey` map lookups and `HashKey` (~4% each). The 1500-draw opening scene still
+waits on the GPU (~1.3 s per 5 s): look at its compute write-backs, which flush synchronously.
+
+**Performance notes (2026-10-20, superseded).** Courtyard gameplay runs at ~28 fps windowed. A 110 s no-window
+
 run (courtyard, ~330 draws per frame) spends 43 s recording draws on the GPU thread and 31 s waiting
 for the GPU: `Flush()` submits and waits for the fence synchronously, so CPU recording and GPU
 execution never overlap. Draw sections: shader scalar pre-execution 18.5 s, resource binding 16 s

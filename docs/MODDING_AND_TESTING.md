@@ -85,17 +85,17 @@ capture. The input accepts the loader syntax (`seconds:BUTTON[:duration]`) plus 
   `sheet.png`, a contact sheet of the frames (with the reference frames above them when present);
 - with `-SaveReference`, stores the frames as the reference set in `build\bin\test_ref\<scenario>\`;
   otherwise compares each frame with its reference (mean absolute difference of 320x180 thumbnails,
-  0-255) and fails above `-Threshold` (default 12).
+  0-255) and fails above `-Threshold` (default 12, or the scenario's own `threshold`).
 
 Current scenarios:
 
 | Scenario | What it reaches | Time |
 |---|---|---|
 | `title` | the intro movie (Japan Studio, Bluepoint, title animation) and the title menu | ~30 s |
-| `opening` | the full prologue (apple taps, comic, movie skipped with CROSS) and the first gameplay | ~2.5 min |
-| `movie` | the `ep00-01c` movie after the apple, with subtitles | ~1.5 min |
-| `courtyard` | Episode 1 courtyard with Kat, Dusty and the pigeons, prologue skipped | ~1.5 min |
-| `ep03` | warp to `ep03_a`: a dialogue, then Kat in the Hekseville alleys | ~1.5 min |
+| `opening` | the prologue: New Game, the floating island, the falling apple (apple taps) | ~1 min |
+| `movie` | the `ep00-01c` movie after the apple (it starts around flip 4200), with credits | ~2 min |
+| `courtyard` | Episode 1 courtyard with Kat, Dusty and the pigeons, prologue skipped | ~1 min |
+| `ep03` | warp to `ep03_a`: a dialogue, then Kat in the Hekseville alleys | ~45 s |
 
 Frame numbers are guest flips, so timing differences between runs move the content slightly; keep
 the captured frames on stable moments (gameplay idling, a dialogue box) and compare with a

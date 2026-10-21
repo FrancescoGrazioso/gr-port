@@ -90,6 +90,7 @@ if(WIN32)
     loader/hle_functions.cpp
     loader/linker.cpp
     loader/vk_window.cpp
+    loader/profiler.cpp
     loader/tls.cpp
     loader/vmem.cpp
     loader/guest.cpp

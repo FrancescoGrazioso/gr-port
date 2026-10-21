@@ -12,7 +12,8 @@
 
 > **Status: early but playable in parts.** The game boots, shows the title menu, plays the opening
 > with the falling apple, the comic dialogues, and reaches gameplay in Hekseville with Kat, the cat
-> and the pigeons on screen, with music, sound effects and the pre-rendered movies.
+> and the pigeons on screen, with music, sound effects and the pre-rendered movies. The first
+> gameplay area runs at a steady 60 fps on an RX 7800 XT.
 
 ---
 
@@ -119,7 +120,7 @@ external/       third-party headers (RenderDoc in-app API, MIT)
 ## Roadmap
 
 1. **Make the game fully playable**: remaining rendering issues (some materials, 2D macro-tiled
-   textures, performance), audio details (envelopes, filters, reverb).
+   textures, performance in busier areas), audio details (envelopes, filters, reverb).
 2. **Mod support**: a `mods/` folder that overrides archive files, editable Lua scripts (most of the
    mission and event logic is plain Lua), code patches, texture and shader replacement, higher
    resolutions and frame rates.

@@ -147,7 +147,9 @@ foreach ($n in $names) {
         foreach ($f in $names_png) {
             if (-not (Test-Path (Join-Path $out $f)) -or -not (Test-Path (Join-Path $ref $f))) { continue }
             $d = Get-Diff (Join-Path $ref $f) (Join-Path $out $f)
-            $ok = $d -le $Threshold
+            # a scenario may allow more (timing-driven fades and camera moves)
+            $limit = if ($sc.threshold -and -not $PSBoundParameters.ContainsKey("Threshold")) { [double]$sc.threshold } else { $Threshold }
+            $ok = $d -le $limit
             if (-not $ok) { $failed++ }
             Write-Host ("   {0}  diff {1,6}  {2}" -f $f, $d, $(if ($ok) { "ok" } else { "FAIL" }))
         }

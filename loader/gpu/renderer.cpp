@@ -87,16 +87,21 @@ bool SafeWrite(uint64_t dst, const void* src, size_t n) {
 uint64_t SampleHash(uint64_t addr, uint64_t bytes) {
     const auto* p = reinterpret_cast<const uint64_t*>(addr);
     const uint64_t words = bytes / 8;
-    uint64_t h = 0x9E3779B97F4A7C15ull ^ bytes;
-    auto mix = [&](uint64_t v) { h = (h ^ v) * 0x100000001B3ull; h ^= h >> 29; };
+    // four independent lanes, so the multiplies overlap instead of forming one dependency chain
+    uint64_t h[4] = {0x9E3779B97F4A7C15ull ^ bytes, 0xC2B2AE3D27D4EB4Full, 0x165667B19E3779F9ull, 0x27D4EB2F165667C5ull};
+    auto run = [&](uint64_t from, uint64_t to) {
+        uint64_t i = from;
+        for (; i + 4 <= to; i += 4)
+            for (int k = 0; k < 4; ++k) { h[k] = (h[k] ^ p[i + k]) * 0x100000001B3ull; h[k] ^= h[k] >> 29; }
+        for (; i < to; ++i) { h[0] = (h[0] ^ p[i]) * 0x100000001B3ull; h[0] ^= h[0] >> 29; }
+    };
     if (bytes <= (256u << 10)) {
-        for (uint64_t i = 0; i < words; ++i) mix(p[i]);
+        run(0, words);
     } else {
-        for (uint64_t chunk = 0; chunk < words; chunk += 4096)
-            for (uint64_t i = chunk; i < std::min(words, chunk + 256); ++i) mix(p[i]);
-        for (uint64_t i = words > 256 ? words - 256 : 0; i < words; ++i) mix(p[i]);
+        for (uint64_t chunk = 0; chunk < words; chunk += 4096) run(chunk, std::min(words, chunk + 256));
+        run(words > 256 ? words - 256 : 0, words);
     }
-    return h;
+    return (h[0] ^ (h[1] * 31) ^ (h[2] * 0x9E3779B97F4A7C15ull)) + h[3];
 }
 
 // VirtualQuery is very slow in this process (thousands of guest regions), so committed ranges that
@@ -556,17 +561,18 @@ public:
     void Draw(const DrawInfo& d, const Regs& r);
     void Dispatch(uint32_t gx, uint32_t gy, uint32_t gz, const Regs& r);
     // Tiny colour targets (exposure / luminance results, up to 8x8) are read back into guest memory:
-    // the game reads them on the CPU (e.g. eboot+0x27358f reads the 1x1 average luminance).
+    // the game reads them on the CPU (e.g. eboot+0x27358f reads the 1x1 average luminance). The copies
+    // ride with the submission and land in guest memory when its slot is retired (about one frame
+    // later, which only delays the exposure adaptation by a frame).
     void ReadbackTinyTargets() {
-        constexpr uint64_t kBase = 32ull << 20; // past the area used for CPU frame copies
-        struct Pending { uint64_t addr, off, bytes; };
-        std::vector<Pending> list;
-        uint64_t off = kBase;
+        const uint64_t base = (32ull << 20) + uint64_t(cur_) * (2ull << 20); // past the area used for CPU frame copies
+        uint64_t off = base;
+        Slot& s = slots_[cur_];
         for (auto& [addr, rt] : rts_) {
             const uint64_t px = uint64_t(rt.img.width) * rt.img.height;
             if (rt.depth || px > 64 || rt.gen == rt.readback_gen) continue;
             const uint64_t bytes = px * std::max<uint32_t>(FormatBytes(rt.img.format), 1);
-            if (off + bytes > readback_.size) break;
+            if (off + bytes > base + (2ull << 20) || off + bytes > readback_.size) break;
             VkCommandBuffer c = Cmd();
             Barrier(c, rt.img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
             VkBufferImageCopy bc{};
@@ -575,19 +581,17 @@ public:
             bc.imageExtent = {rt.img.width, rt.img.height, 1};
             vkCmdCopyImageToBuffer(c, rt.img.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, readback_.buffer, 1, &bc);
             rt.readback_gen = rt.gen;
-            list.push_back({addr, off, bytes});
+            s.tiny.push_back({addr, off, bytes});
             off = (off + bytes + 255) & ~255ull;
+            stats_.tiny_readbacks++;
         }
-        if (list.empty()) return;
-        Flush();
-        for (const auto& p : list)
-            SafeWrite(p.addr, static_cast<const uint8_t*>(readback_.mapped) + p.off, size_t(p.bytes));
-        stats_.tiny_readbacks += list.size();
     }
     void EndSubmission() {
-        Flush();
         ReadbackTinyTargets();
-        if (int64_t(submit_index_) == RenderDocTargetSubmission()) RenderDocEndCapture();
+        Submit(); // the GPU runs this submission while the next one is recorded
+        const bool rdoc = int64_t(submit_index_) == RenderDocTargetSubmission();
+        if (rdoc || qtrace_) Flush();
+        if (rdoc) RenderDocEndCapture();
         if (qtrace_ && qpool_ && qcount_) {
             std::vector<uint64_t> res(qcount_);
             vkGetQueryPoolResults(dev_.device(), qpool_, 0, qcount_, qcount_ * 8, res.data(), 8,
@@ -676,7 +680,7 @@ private:
     // ring allocation from the upload buffer; returns offset or UINT64_MAX
     uint64_t Alloc(uint64_t size, uint64_t align = 256) {
         uint64_t off = (ring_off_ + align - 1) & ~(align - 1);
-        if (off + size > ring_.size) return UINT64_MAX;
+        if (off + size > ring_slot_base_ + kRingHalf) return UINT64_MAX;
         ring_off_ = off + size;
         return off;
     }
@@ -719,9 +723,41 @@ private:
     vk::Device& dev_;
     bool init_ = false, init_ok_ = false;
     VkCommandPool pool_ = VK_NULL_HANDLE;
-    VkCommandBuffer cmd_ = VK_NULL_HANDLE;
-    VkFence fence_ = VK_NULL_HANDLE;
+    // Two submission slots, so the GPU runs one submission while the next is recorded. Each slot owns a
+    // command buffer, a fence, a descriptor pool, half of the upload ring, the images retired while it
+    // was recorded and its deferred tiny read-backs; a slot is reused once its fence has signalled.
+    static constexpr int kSlots = 2;
+    static constexpr uint64_t kRingHalf = 256ull << 20;
+    struct TinyReadback { uint64_t addr, off, bytes; };
+    struct Slot {
+        VkCommandBuffer cmd = VK_NULL_HANDLE;
+        VkFence fence = VK_NULL_HANDLE;
+        VkDescriptorPool pool = VK_NULL_HANDLE;
+        bool pending = false; // submitted, fence not waited yet
+        std::vector<vk::Image> garbage;
+        std::vector<VkImageView> garbage_views;
+        std::vector<TinyReadback> tiny;
+    } slots_[kSlots];
+    int cur_ = 0;
+    uint64_t ring_slot_base_ = 0;
+    VkCommandBuffer cmd_ = VK_NULL_HANDLE; // slots_[cur_].cmd
     bool recording_ = false;
+    void UseSlot(int i);
+    void Retire(Slot& s); // waits for the slot's work, then frees what it kept alive
+    void Submit();        // queues the recorded work and switches slot (Flush = Submit + wait)
+    // Dynamic-rendering pass left open across draws with the same attachments (see Draw); every other
+    // command is recorded through Cmd(), which ends it first.
+    struct OpenPass {
+        bool open = false;
+        VkImageView color[8] = {};
+        VkImageView depth = VK_NULL_HANDLE;
+        uint32_t ncolor = 0, w = 0, h = 0;
+    } pass_;
+    void EndPass();
+    // ShaderHashAndScan, computed once per submission for each program address
+    struct CodeInfo { uint32_t hash; bool swappc; uint64_t submit; };
+    std::unordered_map<uint64_t, CodeInfo> code_info_;
+    uint32_t CodeHash(uint64_t addr, bool* swappc);
     vk::Buffer ring_;
     uint64_t ring_off_ = 0;
     struct UploadKey {
@@ -785,15 +821,7 @@ bool Renderer::Init() {
     ai.commandPool = pool_;
     ai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
     ai.commandBufferCount = 1;
-    vkAllocateCommandBuffers(dev_.device(), &ai, &cmd_);
     VkFenceCreateInfo fci{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
-    vkCreateFence(dev_.device(), &fci, nullptr, &fence_);
-    ring_ = dev_.CreateBuffer(256ull << 20,
-                              VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
-                                  VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
-                              true);
-    scratch_ = dev_.CreateBuffer(64ull << 20, VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, false);
-    readback_ = dev_.CreateBuffer(4096ull * 2304 * 4, VK_BUFFER_USAGE_TRANSFER_DST_BIT, true);
     VkDescriptorPoolSize sizes[] = {{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 65536},
                                     {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 65536},
                                     {VK_DESCRIPTOR_TYPE_SAMPLER, 65536},
@@ -802,18 +830,32 @@ bool Renderer::Init() {
     dci.maxSets = 16384;
     dci.poolSizeCount = 4;
     dci.pPoolSizes = sizes;
-    vkCreateDescriptorPool(dev_.device(), &dci, nullptr, &dpool_);
+    for (Slot& s : slots_) {
+        vkAllocateCommandBuffers(dev_.device(), &ai, &s.cmd);
+        vkCreateFence(dev_.device(), &fci, nullptr, &s.fence);
+        vkCreateDescriptorPool(dev_.device(), &dci, nullptr, &s.pool);
+    }
+    // one half of the ring per slot
+    ring_ = dev_.CreateBuffer(kSlots * kRingHalf,
+                              VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
+                                  VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                              true, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT); // ReBAR VRAM when available: the GPU reads it a lot
+    scratch_ = dev_.CreateBuffer(64ull << 20, VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, false);
+    readback_ = dev_.CreateBuffer(4096ull * 2304 * 4, VK_BUFFER_USAGE_TRANSFER_DST_BIT, true, VK_MEMORY_PROPERTY_HOST_CACHED_BIT);
+    UseSlot(0);
     if (!ring_.mapped || !dpool_ || !cmd_) {
         TraceNote("renderer: failed to create Vulkan resources");
         return false;
     }
-    TraceNote("renderer: using %s (thread %lu)", dev_.gpu_name().c_str(), GetCurrentThreadId());
+    TraceNote("renderer: using %s (thread %lu), upload ring in %s memory", dev_.gpu_name().c_str(), GetCurrentThreadId(),
+              (ring_.mem_flags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) ? "device-local" : "host");
     LoadPipelineCache();
     init_ok_ = true;
     return true;
 }
 
 VkCommandBuffer Renderer::Cmd() {
+    EndPass();
     if (!recording_) {
         VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
         bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
@@ -824,31 +866,69 @@ VkCommandBuffer Renderer::Cmd() {
     return cmd_;
 }
 
-void Renderer::Flush() {
+void Renderer::EndPass() {
+    if (!pass_.open) return;
+    vkCmdEndRendering(cmd_);
+    pass_.open = false;
+}
+
+void Renderer::UseSlot(int i) {
+    cur_ = i;
+    cmd_ = slots_[i].cmd;
+    dpool_ = slots_[i].pool;
+    ring_slot_base_ = uint64_t(i) * kRingHalf;
+    ring_off_ = ring_slot_base_;
+}
+
+void Renderer::Retire(Slot& s) {
+    if (s.pending) {
+        const double wait_t0 = NowMs();
+        if (VkResult r = vkWaitForFences(dev_.device(), 1, &s.fence, VK_TRUE, 5'000'000'000ull); r != VK_SUCCESS)
+            TraceNote("renderer: fence wait failed (%d) - device lost?", int(r));
+        stats_.wait_ms += NowMs() - wait_t0;
+        vkResetFences(dev_.device(), 1, &s.fence);
+        s.pending = false;
+    }
+    for (auto& g : s.garbage) dev_.DestroyImage(g);
+    s.garbage.clear();
+    for (auto v : s.garbage_views) vkDestroyImageView(dev_.device(), v, nullptr);
+    s.garbage_views.clear();
+    for (const auto& p : s.tiny)
+        SafeWrite(p.addr, static_cast<const uint8_t*>(readback_.mapped) + p.off, size_t(p.bytes));
+    s.tiny.clear();
+}
+
+void Renderer::Submit() {
     if (!recording_) return;
+    EndPass();
     vkEndCommandBuffer(cmd_);
+    Slot& s = slots_[cur_];
     VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
     si.commandBufferCount = 1;
     si.pCommandBuffers = &cmd_;
     {
         std::lock_guard<std::mutex> lk(dev_.queue_mutex());
-        if (VkResult r = vkQueueSubmit(dev_.queue(), 1, &si, fence_); r != VK_SUCCESS)
+        if (VkResult r = vkQueueSubmit(dev_.queue(), 1, &si, s.fence); r != VK_SUCCESS)
             TraceNote("renderer: vkQueueSubmit failed (%d)", int(r));
     }
-    const double wait_t0 = NowMs();
-    if (VkResult r = vkWaitForFences(dev_.device(), 1, &fence_, VK_TRUE, 5'000'000'000ull); r != VK_SUCCESS)
-        TraceNote("renderer: fence wait failed (%d) - device lost?", int(r));
-    stats_.wait_ms += NowMs() - wait_t0;
-    vkResetFences(dev_.device(), 1, &fence_);
-    recording_ = false;
-    ring_off_ = 0;
-    upload_cache_.clear();
-    vkResetDescriptorPool(dev_.device(), dpool_, 0);
-    sets_used_ = 0;
-    for (auto& g : garbage_) dev_.DestroyImage(g);
+    s.pending = true;
+    s.garbage.insert(s.garbage.end(), garbage_.begin(), garbage_.end());
     garbage_.clear();
-    for (auto v : garbage_views_) vkDestroyImageView(dev_.device(), v, nullptr);
+    s.garbage_views.insert(s.garbage_views.end(), garbage_views_.begin(), garbage_views_.end());
     garbage_views_.clear();
+    recording_ = false;
+    upload_cache_.clear();
+    sets_used_ = 0;
+    // the next slot: wait for the submission it held (two submissions ago), then reuse it
+    const int next = (cur_ + 1) % kSlots;
+    Retire(slots_[next]);
+    vkResetDescriptorPool(dev_.device(), slots_[next].pool, 0);
+    UseSlot(next);
+}
+
+void Renderer::Flush() {
+    Submit();
+    for (Slot& s : slots_) Retire(s);
 }
 
 void Renderer::FullBarrier(VkCommandBuffer c) {
@@ -1178,7 +1258,6 @@ Texture* Renderer::GetTexture(const uint32_t* t, uint32_t& kind) {
     Texture* tex;
     auto it = textures_.find(key);
     const bool is_new = it == textures_.end();
-    VkCommandBuffer c = Cmd();
     if (is_new) {
         Texture nt;
         VkImageType itype = VK_IMAGE_TYPE_2D;
@@ -1230,10 +1309,10 @@ Texture* Renderer::GetTexture(const uint32_t* t, uint32_t& kind) {
         if (src_rt && src_rt->depth && !from_stencil) vci.components = {VK_COMPONENT_SWIZZLE_R, VK_COMPONENT_SWIZZLE_R, VK_COMPONENT_SWIZZLE_R, VK_COMPONENT_SWIZZLE_R};
         vci.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, levels, 0, layers};
         vkCreateImageView(dev_.device(), &vci, nullptr, &nt.view);
-        Barrier(c, nt.img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+        Barrier(Cmd(), nt.img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
         VkClearColorValue zero{};
         VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, levels, 0, layers};
-        if (!fi.block) vkCmdClearColorImage(c, nt.img.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &zero, 1, &range);
+        if (!fi.block) vkCmdClearColorImage(Cmd(), nt.img.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &zero, 1, &range);
         tex = &(textures_[key] = nt);
         stats_.textures++;
     } else {
@@ -1244,24 +1323,24 @@ Texture* Renderer::GetTexture(const uint32_t* t, uint32_t& kind) {
         if (tex->src_gen != src_rt->gen) {
             tex->src_gen = src_rt->gen;
             const uint32_t cw = std::min(w, src_rt->img.width), ch = std::min(h, src_rt->img.height);
-            Barrier(c, src_rt->img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
-            Barrier(c, tex->img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+            Barrier(Cmd(), src_rt->img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+            Barrier(Cmd(), tex->img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
             if (src_rt->depth) {
                 if (uint64_t(cw) * ch * 4 <= scratch_.size) {
                     VkBufferImageCopy bc{};
                     bc.imageSubresource = {VkImageAspectFlags(from_stencil ? VK_IMAGE_ASPECT_STENCIL_BIT : VK_IMAGE_ASPECT_DEPTH_BIT), 0, 0, 1};
                     bc.imageExtent = {cw, ch, 1};
-                    vkCmdCopyImageToBuffer(c, src_rt->img.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, scratch_.buffer, 1, &bc);
-                    FullBarrier(c);
+                    vkCmdCopyImageToBuffer(Cmd(), src_rt->img.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, scratch_.buffer, 1, &bc);
+                    FullBarrier(Cmd());
                     bc.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-                    vkCmdCopyBufferToImage(c, scratch_.buffer, tex->img.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &bc);
+                    vkCmdCopyBufferToImage(Cmd(), scratch_.buffer, tex->img.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &bc);
                 }
             } else if (FormatBytes(src_rt->img.format) == FormatBytes(tex->img.format) && !fi.block) {
                 VkImageCopy ic{};
                 ic.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
                 ic.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
                 ic.extent = {cw, ch, 1};
-                vkCmdCopyImage(c, src_rt->img.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, tex->img.image,
+                vkCmdCopyImage(Cmd(), src_rt->img.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, tex->img.image,
                                VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &ic);
             } else {
                 Skip("texture/render-target format size mismatch");
@@ -1294,7 +1373,7 @@ Texture* Renderer::GetTexture(const uint32_t* t, uint32_t& kind) {
                 tex->mem_hash = hsh;
                 const uint64_t off = Alloc(bytes + 16ull * nlev, 16);
                 if (off != UINT64_MAX) {
-                    Barrier(c, tex->img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+                    Barrier(Cmd(), tex->img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
                     if (micro) {
                         VkBufferImageCopy bcs[16]{};
                         uint64_t dst = off;
@@ -1311,7 +1390,7 @@ Texture* Renderer::GetTexture(const uint32_t* t, uint32_t& kind) {
                             dst += uint64_t(m.bw) * m.bh * fi.bytes * layers * d3;
                             dst = (dst + 15) & ~15ull;
                         }
-                        vkCmdCopyBufferToImage(c, ring_.buffer, tex->img.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, nlev, bcs);
+                        vkCmdCopyBufferToImage(Cmd(), ring_.buffer, tex->img.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, nlev, bcs);
                     } else {
                         SafeCopy(RingPtr(off), addr, size_t(bytes));
                         VkBufferImageCopy bc{};
@@ -1319,7 +1398,7 @@ Texture* Renderer::GetTexture(const uint32_t* t, uint32_t& kind) {
                         bc.bufferRowLength = std::max(pitch, w);
                         bc.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, layers};
                         bc.imageExtent = {w, h, d3};
-                        vkCmdCopyBufferToImage(c, ring_.buffer, tex->img.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &bc);
+                        vkCmdCopyBufferToImage(Cmd(), ring_.buffer, tex->img.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &bc);
                     }
                     stats_.tex_uploads++;
                     if (tiling != 8 && tiling != 31 && !micro) {
@@ -1378,8 +1457,8 @@ Texture* Renderer::GetTexture(const uint32_t* t, uint32_t& kind) {
                 VkClearColorValue one{};
                 one.float32[0] = one.float32[1] = one.float32[2] = one.float32[3] = 1.0f;
                 VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, tex->layers};
-                Barrier(c, tex->img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
-                vkCmdClearColorImage(c, tex->img.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &one, 1, &range);
+                Barrier(Cmd(), tex->img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+                vkCmdClearColorImage(Cmd(), tex->img.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &one, 1, &range);
             }
             static int logged = 0;
             if (logged++ < 24 || qtrace_)
@@ -1388,7 +1467,8 @@ Texture* Renderer::GetTexture(const uint32_t* t, uint32_t& kind) {
                           (unsigned long long)submit_index_, t[0], t[1], t[2], t[3], t[4], t[5]);
         }
     }
-    Barrier(c, tex->img, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    // Cmd() only when something is recorded: it ends an open render pass
+    if (tex->img.layout != VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL) Barrier(Cmd(), tex->img, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
     return tex;
 }
 
@@ -1401,10 +1481,14 @@ bool Renderer::BindShaderResources(ShaderEntry* e, const std::vector<uint32_t>& 
     if (vkAllocateDescriptorSets(dev_.device(), &ai, &set) != VK_SUCCESS) return false;
     sets_used_++;
     const auto& t = *e->t;
-    std::vector<VkWriteDescriptorSet> writes;
-    std::vector<VkDescriptorBufferInfo> bufs(t.resources.size() + 1);
-    std::vector<VkDescriptorImageInfo> imgs(t.resources.size());
-    writes.reserve(t.resources.size() + 1);
+    // reused between calls (no heap traffic per draw); not re-entrant
+    static thread_local std::vector<VkWriteDescriptorSet> writes;
+    static thread_local std::vector<VkDescriptorBufferInfo> bufs;
+    static thread_local std::vector<VkDescriptorImageInfo> imgs;
+    writes.clear();
+    writes.reserve(66);
+    bufs.assign(t.resources.size() + 1, {});
+    imgs.assign(t.resources.size(), {});
 
     const uint64_t sd_bytes = std::max<uint64_t>(sdata.size() * 4, 16);
     const uint64_t sd_off = Alloc(sd_bytes);
@@ -1596,6 +1680,16 @@ uint32_t ShaderHashAndScan(uint64_t addr, bool* has_swappc) {
     return uint32_t(Fnv(code, size));
 }
 
+uint32_t Renderer::CodeHash(uint64_t addr, bool* swappc) {
+    CodeInfo& ci = code_info_[addr];
+    if (ci.submit != submit_index_ + 1) { // +1: a fresh entry (submit 0) is never current
+        ci.hash = ShaderHashAndScan(addr, &ci.swappc);
+        ci.submit = submit_index_ + 1;
+    }
+    *swappc = ci.swappc;
+    return ci.hash;
+}
+
 VkPrimitiveTopology Topology(uint32_t prim, bool* ok) {
     *ok = true;
     switch (prim) {
@@ -1661,7 +1755,7 @@ void Renderer::Dispatch(uint32_t gx, uint32_t gy, uint32_t gz, const Regs& r) {
     stats_.dispatches++;
     if (!Init()) return;
     if (!gx || !gy || !gz) return;
-    if (ring_off_ > ring_.size / 2 || sets_used_ > 12000) Flush();
+    if (ring_off_ - ring_slot_base_ > kRingHalf / 2 || sets_used_ > 12000) Submit();
     const uint64_t cs_addr = PgmAddr(r, reg::COMPUTE_PGM_LO);
     if (!cs_addr || !Readable(cs_addr, 64)) { Skip("compute: no shader"); return; }
     const uint32_t rsrc2 = r.S(0x2E13);
@@ -1670,7 +1764,7 @@ void Renderer::Dispatch(uint32_t gx, uint32_t gy, uint32_t gz, const Regs& r) {
     key.stage = Stage::Compute;
     key.code = cs_addr;
     bool dummy;
-    key.code_hash = ShaderHashAndScan(cs_addr, &dummy);
+    key.code_hash = CodeHash(cs_addr, &dummy);
     key.user_sgprs = (rsrc2 >> 1) & 0x1F;
     key.cs_sys_sgprs = uint8_t(((rsrc2 >> 7) & 7) | (((rsrc2 >> 10) & 1) << 3));
     key.lds_dwords = ((rsrc2 >> 15) & 0x1FF) * 128;
@@ -1811,7 +1905,7 @@ bool Renderer::RunEsGs(const DrawInfo& d, const Regs& r) {
     es.code = PgmAddr(r, reg::SPI_SHADER_PGM_LO_ES);
     if (!es.code || !Readable(es.code, 64)) { Skip("geometry pipeline: no ES"); return false; }
     bool swappc = false;
-    es.code_hash = ShaderHashAndScan(es.code, &swappc);
+    es.code_hash = CodeHash(es.code, &swappc);
     uint32_t es_user[16], gs_user[16];
     for (uint32_t i = 0; i < 16; ++i) {
         es_user[i] = r.S(0x2CCC + i);
@@ -1833,7 +1927,7 @@ bool Renderer::RunEsGs(const DrawInfo& d, const Regs& r) {
     gs.stage = Stage::Compute;
     gs.code = PgmAddr(r, reg::SPI_SHADER_PGM_LO_GS);
     if (!gs.code || !Readable(gs.code, 64)) { Skip("geometry pipeline: no GS"); return false; }
-    gs.code_hash = ShaderHashAndScan(gs.code, &swappc);
+    gs.code_hash = CodeHash(gs.code, &swappc);
     gs.user_sgprs = (r.S(0x2C8B) >> 1) & 0x1F;
     gs.cs_threads[0] = 64;
     gs.cs_threads[1] = gs.cs_threads[2] = 1;
@@ -1896,7 +1990,7 @@ void Renderer::Draw(const DrawInfo& d, const Regs& r) {
     writebacks_.clear();
     stats_.draws++;
     if (!Init()) return;
-    if (ring_off_ > ring_.size / 2 || sets_used_ > 12000) Flush();
+    if (ring_off_ - ring_slot_base_ > kRingHalf / 2 || sets_used_ > 12000) Submit();
 
     // ---- targets
     const uint32_t color_ctl = r.C(0xA202);
@@ -1954,7 +2048,7 @@ void Renderer::Draw(const DrawInfo& d, const Regs& r) {
     vk_key.stage = Stage::Vertex;
     vk_key.code = vs_addr;
     bool swappc = false;
-    vk_key.code_hash = ShaderHashAndScan(vs_addr, &swappc);
+    vk_key.code_hash = CodeHash(vs_addr, &swappc);
     vk_key.user_sgprs = (r.S(0x2C4B) >> 1) & 0x1F;
     if (swappc) {
         vk_key.fetch = uint64_t(vs_user[0]) | (uint64_t(vs_user[1]) << 32);
@@ -1985,7 +2079,7 @@ void Renderer::Draw(const DrawInfo& d, const Regs& r) {
     ps_key.code = ps_addr;
     if (ps_addr) {
         bool dummy;
-        ps_key.code_hash = ShaderHashAndScan(ps_addr, &dummy);
+        ps_key.code_hash = CodeHash(ps_addr, &dummy);
         ps_key.user_sgprs = (r.S(0x2C0B) >> 1) & 0x1F;
         ps_key.ps_input_addr = r.C(reg::SPI_PS_INPUT_ADDR);
         for (uint32_t i = 0; i < 32; ++i) ps_key.ps_input_cntl[i] = r.C(0xA191 + i);
@@ -2029,8 +2123,8 @@ void Renderer::Draw(const DrawInfo& d, const Regs& r) {
         ps = GetShader(ps_key);
         if (!ps->ok) { Skip("pixel shader failed"); return; }
     }
-    std::vector<uint32_t> vs_sdata, ps_sdata;
-    ResourceDescriptors vs_desc, ps_desc;
+    static thread_local std::vector<uint32_t> vs_sdata, ps_sdata; // reused between draws
+    static thread_local ResourceDescriptors vs_desc, ps_desc;
     if (!PrepareShader(vs, vk_key, vs_user, vs_sdata, vs_desc)) { Skip("vertex shader failed"); return; }
     if (ps && !PrepareShader(ps, ps_key, ps_user, ps_sdata, ps_desc)) { Skip("pixel shader failed"); return; }
 
@@ -2130,11 +2224,25 @@ void Renderer::Draw(const DrawInfo& d, const Regs& r) {
 
     Mark(5);
     // ---- record
-    VkCommandBuffer c = Cmd();
-    for (uint32_t i = 0; i < ncolor; ++i)
-        if (att[i].rt) Barrier(c, att[i].rt->img, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
-    if (dt) Barrier(c, dt->img, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
-    FullBarrier(c);
+    // Consecutive draws into the same attachments share one rendering pass: nothing was recorded between
+    // them (Cmd() ends the pass), so the attachments are still in their layouts and draw-to-draw ordering
+    // is the rasterizer's.
+    OpenPass want;
+    want.open = true;
+    for (uint32_t i = 0; i < ncolor; ++i) want.color[i] = att[i].rt ? att[i].rt->img.view : VK_NULL_HANDLE;
+    want.depth = dt ? dt->img.view : VK_NULL_HANDLE;
+    want.ncolor = ncolor;
+    want.w = rt_w;
+    want.h = rt_h;
+    const bool reuse = pass_.open && pass_.ncolor == want.ncolor && pass_.depth == want.depth && pass_.w == want.w &&
+                       pass_.h == want.h && std::equal(want.color, want.color + ncolor, pass_.color);
+    VkCommandBuffer c = reuse ? cmd_ : Cmd();
+    if (!reuse) {
+        for (uint32_t i = 0; i < ncolor; ++i)
+            if (att[i].rt) Barrier(c, att[i].rt->img, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+        if (dt) Barrier(c, dt->img, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
+        FullBarrier(c);
+    }
 
     // viewport / scissor
     const float xs = r.Cf(0xA10F), xo = r.Cf(0xA110), ys = r.Cf(0xA111), yo = r.Cf(0xA112), zs = r.Cf(0xA113),
@@ -2152,30 +2260,33 @@ void Renderer::Draw(const DrawInfo& d, const Regs& r) {
     if (x1 <= x0 || y1 <= y0) { Skip("empty scissor"); return; }
     VkRect2D scissor{{x0, y0}, {uint32_t(x1 - x0), uint32_t(y1 - y0)}};
 
-    VkRenderingAttachmentInfo cai[8]{};
-    for (uint32_t i = 0; i < ncolor; ++i) {
-        cai[i].sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
-        if (!att[i].rt) continue;
-        cai[i].imageView = att[i].rt->img.view;
-        cai[i].imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-        cai[i].loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
-        cai[i].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    if (!reuse) {
+        VkRenderingAttachmentInfo cai[8]{};
+        for (uint32_t i = 0; i < ncolor; ++i) {
+            cai[i].sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
+            if (!att[i].rt) continue;
+            cai[i].imageView = att[i].rt->img.view;
+            cai[i].imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+            cai[i].loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+            cai[i].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+        }
+        VkRenderingAttachmentInfo dai{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
+        if (dt) {
+            dai.imageView = dt->img.view;
+            dai.imageLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+            dai.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+            dai.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+        }
+        VkRenderingInfo ri{VK_STRUCTURE_TYPE_RENDERING_INFO};
+        ri.renderArea = {{0, 0}, {rt_w, rt_h}}; // the pass may serve later draws with other scissors
+        ri.layerCount = 1;
+        ri.colorAttachmentCount = ncolor;
+        ri.pColorAttachments = cai;
+        ri.pDepthAttachment = dt ? &dai : nullptr;
+        ri.pStencilAttachment = dt ? &dai : nullptr;
+        vkCmdBeginRendering(c, &ri);
+        pass_ = want;
     }
-    VkRenderingAttachmentInfo dai{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
-    if (dt) {
-        dai.imageView = dt->img.view;
-        dai.imageLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
-        dai.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
-        dai.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
-    }
-    VkRenderingInfo ri{VK_STRUCTURE_TYPE_RENDERING_INFO};
-    ri.renderArea = scissor;
-    ri.layerCount = 1;
-    ri.colorAttachmentCount = ncolor;
-    ri.pColorAttachments = cai;
-    ri.pDepthAttachment = dt ? &dai : nullptr;
-    ri.pStencilAttachment = dt ? &dai : nullptr;
-    vkCmdBeginRendering(c, &ri);
     vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe->pipe);
     VkDescriptorSet sets[2] = {vs_set, ps_set};
     vkCmdBindDescriptorSets(c, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe->layout, 0, ps ? 2 : 1, sets, 0, nullptr);
@@ -2225,7 +2336,8 @@ void Renderer::Draw(const DrawInfo& d, const Regs& r) {
         vkCmdDraw(c, count, inst, 0, 0);
     }
     if (query) vkCmdEndQuery(c, qpool_, qcount_++);
-    vkCmdEndRendering(c);
+    // the pass stays open for the next draw, unless this one stored to memory a later draw may read
+    if (!writebacks_.empty() || !written_images_.empty()) EndPass();
     for (uint32_t i = 0; i < ncolor; ++i)
         if (att[i].rt && att[i].mask) att[i].rt->gen++;
     if (dt && (z_write || stencil)) dt->gen++;
@@ -2236,11 +2348,22 @@ void Renderer::Draw(const DrawInfo& d, const Regs& r) {
 void Renderer::Flip(int32_t index) {
     struct Acc { double t0; double& acc; ~Acc() { acc += NowMs() - t0; } } acc{NowMs(), stats_.flip_ms};
     stats_.flips++;
+    { // frame rate every 5 s, with the host time split of that window (profiling)
+        static double t0 = NowMs(), d0 = 0, w0 = 0;
+        static uint64_t f0 = 0, n0 = 0;
+        const double now = NowMs();
+        if (now - t0 >= 5000) {
+            TraceNote("renderer: %.1f fps at flip %llu (last 5 s: %.0f ms recording, %.0f ms waiting for the GPU, %.0f draws per flip)",
+                      double(stats_.flips - f0) * 1000.0 / (now - t0), (unsigned long long)stats_.flips,
+                      stats_.draw_ms - d0, stats_.wait_ms - w0, double(stats_.draws - n0) / double(std::max<uint64_t>(stats_.flips - f0, 1)));
+            t0 = now; f0 = stats_.flips; d0 = stats_.draw_ms; w0 = stats_.wait_ms; n0 = stats_.draws;
+        }
+    }
     if (!Init()) return;
     const videoout::FrameInfo fi = videoout::Buffer(index);
     auto it = rts_.find(fi.addr);
     if (!fi.addr || it == rts_.end()) {
-        Flush();
+        Submit();
         return;
     }
     RenderTarget& rt = it->second;
@@ -2296,7 +2419,10 @@ void Renderer::Flip(int32_t index) {
             bc.imageExtent = {w, h, 1};
             vkCmdCopyImageToBuffer(c, out_.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, readback_.buffer, 1, &bc);
         }
-        Flush();
+        // the presenter blits out_ in a later submission on the same queue (ordered by the barrier above),
+        // so only read-backs need the GPU to finish here
+        if (dump || cpu) Flush();
+        else Submit();
         out_ready_ = true;
         ++out_seq_;
         if (HANDLE ev = OutputFrameEvent()) SetEvent(ev);
